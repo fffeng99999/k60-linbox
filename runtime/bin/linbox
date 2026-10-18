@@ -1015,17 +1015,31 @@ cmd_shell() {
 }
 
 # App 终端专用：busybox script 在容器外提供 PTY（Ubuntu base 里没有 busybox）。
+# busybox script 不支持运行中改窗口大小，所以初始行列由调用方一次给死（--cols/--rows）。
 cmd_attach() {
-    _name=${1:-}
+    _name=${1:-}; shift || true
+    _cols=""; _rows=""
+    while [ $# -gt 0 ]; do
+        _k=$1; shift
+        case "$_k" in
+            --cols) _cols=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            --rows) _rows=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            *) fail BAD_ARGS "未知参数: $_k" ;;
+        esac
+    done
     load_config "$_name"
     _pid="$(running_pid "$_name" 2>/dev/null)" || fail NOT_RUNNING "容器未运行: $_name"
     command -v busybox >/dev/null 2>&1 || fail TOOL_MISSING "缺少 busybox，无法提供 PTY"
     _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
     _root="/proc/$_pid/root"
+
+    _stty=""
+    [ -n "$_cols" ] && [ -n "$_rows" ] && _stty="stty cols $_cols rows $_rows 2>/dev/null; "
+
     if [ -x "$_root/usr/bin/env" ]; then
-        _sc="chroot $_root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=${TERM:-xterm} LANG=C.UTF-8 /bin/sh -i"
+        _sc="chroot $_root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=${TERM:-xterm} LANG=C.UTF-8 /bin/sh -c '${_stty}exec /bin/sh -i'"
     else
-        _sc="chroot $_root /bin/sh -i"
+        _sc="chroot $_root /bin/sh -c '${_stty}exec /bin/sh -i'"
     fi
     log "接入 $_name 终端（Ctrl-D 退出）"
     ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \

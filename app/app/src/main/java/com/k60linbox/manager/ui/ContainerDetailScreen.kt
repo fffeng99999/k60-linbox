@@ -21,9 +21,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.k60linbox.manager.net.MirrorPresets
 import com.k60linbox.manager.runtime.SnapshotInfo
 
-private val DETAIL_TABS = listOf("概览", "端口", "快照", "日志")
+private val DETAIL_TABS = listOf("概览", "终端", "端口", "快照", "日志")
 
-/** 单个容器的管理界面。终端与文件页将在后续阶段加入。 */
+/** 单个容器的管理界面。文件页将在后续阶段加入。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
@@ -73,8 +73,9 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
             }
             when (tab) {
                 0 -> OverviewTab(state, vm, onDestroy = { destroyAsk = true })
-                1 -> PortsTab(state, vm)
-                2 -> SnapshotsTab(
+                1 -> TerminalTab(containerName = name, running = state.info?.running == true)
+                2 -> PortsTab(state, vm)
+                3 -> SnapshotsTab(
                     state = state,
                     vm = vm,
                     onExport = { snapshot ->
