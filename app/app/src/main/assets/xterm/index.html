@@ -9,8 +9,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
   <link rel="stylesheet" href="xterm.css">
   <style>
-    html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
-    #t { width: 100%; height: 100%; padding: 2px 0 0 2px; box-sizing: border-box; }
+    /* 真机实测：WebView 里 html/body 的 height:100% 链不生效，宿主高度会塌成 0，
+       再加上 body 的 overflow:hidden 就会把整块终端裁掉（表现为纯黑）。
+       因此这里不再依赖百分比高度，改由脚本按量到的视口像素显式设置。 */
+    html, body { margin: 0; padding: 0; background: #000; }
+    #t { box-sizing: border-box; }
   </style>
 </head>
 <body>
@@ -19,8 +22,8 @@
   <script>
   (function () {
     var FONT_SIZE = 14;
-    var CELL_H = Math.round(FONT_SIZE * 1.2);
-    var CELL_W = Math.round(FONT_SIZE * 0.6);
+    var CELL_H = FONT_SIZE * 1.15;   // 略保守，宁可少几行也不让末行被裁
+    var CELL_W = FONT_SIZE * 0.62;   // 同上，避免列数超出可视宽度
     var MIN_W = 200;
     var MIN_H = 200;
     var MAX_TRIES = 30;          // 最多等 3 秒
@@ -51,6 +54,19 @@
       return el.clientWidth + 'x' + el.clientHeight;
     }
 
+    // 把宿主元素按视口像素钉死，绕开百分比高度在 WebView 里失效的问题。
+    function fitHost(w, h) {
+      var t = document.getElementById('t');
+      t.style.width = w + 'px';
+      t.style.height = h + 'px';
+      t.style.overflow = 'hidden';
+      document.documentElement.style.width = w + 'px';
+      document.documentElement.style.height = h + 'px';
+      document.body.style.width = w + 'px';
+      document.body.style.height = h + 'px';
+      document.body.style.overflow = 'hidden';
+    }
+
     // Kotlin -> 终端：xterm 的 write 接受 Uint8Array，会自行做 UTF-8 解码，
     // 因此跨 chunk 切断的多字节字符也能正确拼回来。
     window.linboxFeed = function (base64) {
@@ -76,9 +92,7 @@
     // 用视觉视口而不是元素 rect：真机实测 WebView 刚建立时 getBoundingClientRect()
     // 会给出「428x85」这种布局还没生效的值，导致 xterm 只画 5 行且看不见文字。
     function measure() {
-      var w = window.innerWidth;
-      var h = window.innerHeight;
-      return [w, h];
+      return [window.innerWidth, window.innerHeight];
     }
 
     function start(attempt) {
@@ -89,6 +103,19 @@
         return;
       }
       started = true;
+
+      var wide = size[0] >= MIN_W && size[1] >= MIN_H;
+      fitHost(wide ? size[0] : MIN_W, wide ? size[1] : MIN_H);
+
+      var cols, rows;
+      if (wide) {
+        cols = Math.max(20, Math.floor(size[0] / CELL_W));
+        rows = Math.max(5, Math.floor(size[1] / CELL_H));
+      } else {
+        // 视口一直没量出来：用兜底值先把会话开起来，不把用户卡在这儿
+        cols = FALLBACK_COLS;
+        rows = FALLBACK_ROWS;
+      }
 
       try {
         term = new Terminal({
@@ -108,22 +135,13 @@
         try { LinboxBridge.write(toBase64(encoder.encode(data))); } catch (e) { }
       });
 
-      var cols, rows;
-      if (size[0] >= MIN_W && size[1] >= MIN_H) {
-        cols = Math.max(20, Math.floor(size[0] / CELL_W));
-        rows = Math.max(5, Math.floor(size[1] / CELL_H));
-      } else {
-        // 视口一直没量出来：用兜底值先把会话开起来，不把用户卡在这儿
-        cols = FALLBACK_COLS;
-        rows = FALLBACK_ROWS;
-      }
       term.resize(cols, rows);
       var t = document.getElementById('t');
       log('viewport ' + size[0] + 'x' + size[1] + ' -> ' + cols + 'x' + rows + ' (try ' + attempt + ')');
-      log('open OK | 容器=' + box(t) + ' | xterm=' + box(term.element) +
+      log('open OK | 宿主=' + box(t) + ' | xterm=' + box(term.element) +
           ' | 行容器=' + box(document.querySelector('.xterm-rows')) +
           ' | 屏=' + box(document.querySelector('.xterm-screen')) +
-          ' | renderer=' + (term._core && term._core._renderService ? 'yes' : 'no'));
+          ' | body=' + box(document.body) + ' | html=' + box(document.documentElement));
 
       // 只报一次：busybox script 不支持会话中途 resize
       try { LinboxBridge.ready(cols, rows); } catch (e) { }
