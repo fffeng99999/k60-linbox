@@ -3,6 +3,7 @@ package com.k60linbox.manager.term
 
 import com.k60linbox.manager.runtime.Linbox
 import java.io.OutputStream
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -14,6 +15,11 @@ import kotlin.concurrent.thread
  * 输入由 [write] 写入进程 stdin。
  */
 class TerminalSession(private val containerName: String) {
+
+    private companion object {
+        /** Ctrl-D：交互式 shell 收到它就当作 EOF。 */
+        const val EOF: Int = 4
+    }
 
     private var process: Process? = null
     private var reader: Thread? = null
@@ -74,10 +80,26 @@ class TerminalSession(private val containerName: String) {
         }
     }
 
+    /**
+     * 结束会话。
+     *
+     * 先往 PTY 里送一个 EOF（Ctrl-D）让容器内的交互式 shell 自己退出，再兜底 destroy。
+     * 设备实测：只 destroy 的话作用到的是 `su`，里面的 `busybox script` 与 shell 会被留下，
+     * 一直占着 PTY；单独给 stdin 关掉（EOF）也不会让 script 退出。
+     */
     fun close() {
         closed = true
+        val current = process ?: return
         try {
-            process?.destroy()
+            current.outputStream?.use {
+                it.write(EOF)
+                it.flush()
+            }
+            current.waitFor(500, TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+        }
+        try {
+            current.destroy()
         } catch (_: Throwable) {
         }
         process = null

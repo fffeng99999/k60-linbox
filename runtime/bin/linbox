@@ -1168,11 +1168,13 @@ mirror_rewrite() {
     _n=0
     for f in $_files; do
         [ -f "$f.linbox.bak" ] || cp "$f" "$f.linbox.bak" 2>/dev/null || true
-        sed -e "s|https\?://archive\.ubuntu\.com/ubuntu|http://$_host/ubuntu|g" \
-            -e "s|https\?://security\.ubuntu\.com/ubuntu|http://$_host/ubuntu|g" \
-            -e "s|https\?://ports\.ubuntu\.com/ubuntu-ports|http://$_host/ubuntu-ports|g" \
-            -e "s|https\?://deb\.debian\.org/debian|http://$_host/debian|g" \
-            -e "s|https\?://security\.debian\.org/debian-security|http://$_host/debian-security|g" \
+        # 注意：不能用 GNU 的 `https\?`——Android 的 sed 是 toybox，不支持 `\?` 可选量词
+        # （实测 `https*://` 可以同时匹配 http:// 与 https://，`https\?://` 一条都匹配不上）。
+        sed -e "s|https*://archive\.ubuntu\.com/ubuntu|http://$_host/ubuntu|g" \
+            -e "s|https*://security\.ubuntu\.com/ubuntu|http://$_host/ubuntu|g" \
+            -e "s|https*://ports\.ubuntu\.com/ubuntu-ports|http://$_host/ubuntu-ports|g" \
+            -e "s|https*://deb\.debian\.org/debian|http://$_host/debian|g" \
+            -e "s|https*://security\.debian\.org/debian-security|http://$_host/debian-security|g" \
             "$f.linbox.bak" > "$f" 2>/dev/null || true
         _n=$((_n + 1))
     done
@@ -1240,8 +1242,8 @@ cmd_ls() {
         [ -e "$_e" ] || continue
         _bn="$(basename "$_e")"
         _t=file
-        [ -L "$_e" ] && _t=link
-        [ -d "$_e" ] && _t=di
+        if [ -L "$_e" ]; then _t=link; fi
+        if [ -d "$_e" ]; then _t=dir; fi
         _sz="$(stat -c %s "$_e" 2>/dev/null || printf 0)"
         _mode="$(stat -c %a "$_e" 2>/dev/null || printf '?')"
         if [ "$J" = "1" ]; then
