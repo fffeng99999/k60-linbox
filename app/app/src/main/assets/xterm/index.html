@@ -11,26 +11,28 @@
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
     #t { width: 100%; height: 100%; padding: 2px 0 0 2px; box-sizing: border-box; }
-    #hint { position: absolute; left: 8px; bottom: 6px; color: #777; font: 12px monospace; }
   </style>
 </head>
 <body>
   <div id="t"></div>
-  <div id="hint"></div>
   <script src="xterm.js"></script>
   <script>
   (function () {
     var FONT_SIZE = 14;
-    var CHAR_H = Math.round(FONT_SIZE * 1.2);   // 等宽字体行高的近似值
-    var CHAR_W = Math.round(FONT_SIZE * 0.6);   // 等宽字体字符宽的近似值
-    var MAX_WAIT = 60;                          // 最多等 6 秒布局稳定
+    var CELL_H = Math.round(FONT_SIZE * 1.2);
+    var CELL_W = Math.round(FONT_SIZE * 0.6);
+    var MIN_W = 200;
+    var MIN_H = 200;
+    var MAX_TRIES = 30;          // 最多等 3 秒
+    var FALLBACK_COLS = 80;      // 兜底：宁可列行数不准，也不能一直不连
+    var FALLBACK_ROWS = 24;
 
     var term = null;
-    var booted = false;
+    var started = false;
     var encoder = new TextEncoder();
 
     function log(msg) {
-      try { LinboxBridge.log(msg); } catch (e) { }
+      try { LinboxBridge.log(String(msg)); } catch (e) { }
     }
 
     function toBase64(bytes) {
@@ -40,7 +42,7 @@
     }
 
     // Kotlin -> 终端：xterm 的 write 接受 Uint8Array，会自行做 UTF-8 解码，
-    // 所以跨 chunk 切断的多字节字符也能正确拼回来。
+    // 因此跨 chunk 切断的多字节字符也能正确拼回来。
     window.linboxFeed = function (base64) {
       if (!term) return;
       var bin = atob(base64);
@@ -54,53 +56,55 @@
       term.write('\r\n\u001b[33m[会话已结束，退出码 ' + code + '] 点上方「重开会话」可重开\u001b[0m\r\n');
     };
 
-    function viewport() {
-      var el = document.getElementById('t');
-      var rect = el.getBoundingClientRect();
-      var w = rect.width > 0 ? rect.width : document.documentElement.clientWidth;
-      var h = rect.height > 0 ? rect.height : document.documentElement.clientHeight;
+    // 用视觉视口而不是元素 rect：真机实测 WebView 刚建立时 getBoundingClientRect()
+    // 会给出「428x85」这种布局还没生效的值，导致 xterm 只画 5 行且看不见文字。
+    function measure() {
+      var w = window.innerWidth;
+      var h = window.innerHeight;
       return [w, h];
     }
 
-    // 关键：WebView 刚创建时布局还没稳定，这时候量出来会是「宽 428 高 85」这种离谱值
-    // （实测 xterm 只画 5 行且文字看不见）。所以要等到尺寸合理再开终端。
-    function boot(attempt) {
-      if (booted) return;
-      var size = viewport();
-      if ((size[0] < 100 || size[1] < 100) && attempt < MAX_WAIT) {
-        setTimeout(function () { boot(attempt + 1); }, 100);
+    function start(attempt) {
+      if (started) return;
+      var size = measure();
+      if ((size[0] < MIN_W || size[1] < MIN_H) && attempt < MAX_TRIES) {
+        setTimeout(function () { start(attempt + 1); }, 100);
         return;
       }
-      booted = true;
+      started = true;
 
-      var el = document.getElementById('t');
       term = new Terminal({
         fontSize: FONT_SIZE,
         cursorBlink: true,
         scrollback: 2000,
         theme: { background: '#000000', foreground: '#e6e6e6' }
       });
-      term.open(el);
+      term.open(document.getElementById('t'));
       window.term = term;
 
-      // 键盘输入 -> Kotlin（base64 承载 UTF-8 字节，避免中文/转义字符被破坏）
       term.onData(function (data) {
         try { LinboxBridge.write(toBase64(encoder.encode(data))); } catch (e) { }
       });
 
-      var cols = Math.max(20, Math.floor(size[0] / CHAR_W));
-      var rows = Math.max(5, Math.floor(size[1] / CHAR_H));
+      var cols, rows;
+      if (size[0] >= MIN_W && size[1] >= MIN_H) {
+        cols = Math.max(20, Math.floor(size[0] / CELL_W));
+        rows = Math.max(5, Math.floor(size[1] / CELL_H));
+      } else {
+        // 视口一直没量出来：用兜底值先把会话开起来，不把用户卡在这儿
+        cols = FALLBACK_COLS;
+        rows = FALLBACK_ROWS;
+      }
       term.resize(cols, rows);
-      document.getElementById('hint').textContent = cols + 'x' + rows;
-      log('measure ' + cols + 'x' + rows + ' (attempt ' + attempt + ')');
+      log('viewport ' + size[0] + 'x' + size[1] + ' -> ' + cols + 'x' + rows + ' (try ' + attempt + ')');
 
-      // 行列数只报一次：busybox script 不支持会话中途 resize
+      // 只报一次：busybox script 不支持会话中途 resize
       try { LinboxBridge.ready(cols, rows); } catch (e) { }
       term.focus();
     }
 
-    if (document.readyState === 'complete') boot(0);
-    else window.addEventListener('load', function () { boot(0); });
+    if (document.readyState === 'complete') start(0);
+    else window.addEventListener('load', function () { start(0); });
   })();
   </script>
 </body>
