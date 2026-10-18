@@ -2,6 +2,7 @@
 package com.k60linbox.manager.ui
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.k60linbox.manager.data.ContainerRepository
@@ -9,13 +10,16 @@ import com.k60linbox.manager.data.PortRepository
 import com.k60linbox.manager.data.SnapshotRepository
 import com.k60linbox.manager.data.describe
 import com.k60linbox.manager.runtime.ContainerInfo
+import com.k60linbox.manager.runtime.Linbox
 import com.k60linbox.manager.runtime.PortMapping
 import com.k60linbox.manager.runtime.SnapshotInfo
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** 单个容器的详情：概览、端口、快照、日志。 */
 class ContainerDetailViewModel(app: Application, val containerName: String) : AndroidViewModel(app) {
@@ -77,7 +81,55 @@ class ContainerDetailViewModel(app: Application, val containerName: String) : An
     fun setMemory(mb: Int) = act("内存限额") { containers.setMemory(containerName, mb) }
     fun setAutostart(on: Boolean) = act("开机自启") { containers.setAutostart(containerName, on) }
     fun resize(size: String) = act("扩容") { containers.resize(containerName, size) }
-    fun applyMirror(preset: String) = act("换源") { containers.mirror(containerName, preset) }
+
+    /** 换源后如果容器在跑，顺手跑一次 apt-get update 验证源是否可用。 */
+    fun applyMirrorAndVerify(preset: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true) }
+            val note = containers.mirror(containerName, preset).fold(
+                {
+                    if (_state.value.info?.running == true) {
+                        containers.exec(containerName, "apt-get update").fold(
+                            { result -> "换源完成；apt-get update 退出码 ${result.exitCode}" },
+                            { error -> "换源完成，但 apt-get update 失败：${error.describe()}" },
+                        )
+                    } else {
+                        "换源完成（容器未运行，启动后再验证 apt）"
+                    }
+                },
+                { error -> "换源失败：${error.describe()}" },
+            )
+            _state.update { it.copy(busy = false, message = note) }
+            refresh()
+        }
+    }
+
+    /** 把快照镜像导出到用户选定的位置（经 root 按字节流搬运，不过内存字符串）。 */
+    fun exportSnapshot(snapshot: SnapshotInfo, uri: Uri) {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    if (snapshot.path.isBlank()) {
+                        throw IllegalStateException("运行时不支持导出（请更新 Magisk 模块）")
+                    }
+                    val sink = getApplication<Application>().contentResolver.openOutputStream(uri)
+                        ?: throw IllegalStateException("无法打开所选位置")
+                    sink.use { out ->
+                        val raw = Linbox.stream("cat ${Linbox.quote(snapshot.path)}", out)
+                        if (!raw.ok) throw IllegalStateException(raw.output.ifBlank { "读取快照失败" })
+                    }
+                }
+            }
+            _state.update {
+                it.copy(
+                    message = result.fold(
+                        { "快照 ${snapshot.label} 已导出" },
+                        { error -> "导出失败：${error.describe()}" },
+                    ),
+                )
+            }
+        }
+    }
 
     fun addPort(proto: String, hostPort: Int, containerPort: Int) =
         act("添加端口") { ports.add(containerName, proto, hostPort, containerPort) }

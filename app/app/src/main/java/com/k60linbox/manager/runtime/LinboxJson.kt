@@ -121,6 +121,8 @@ data class PortMapping(
 data class SnapshotInfo(
     val label: String,
     val bytes: Long = 0,
+    /** 快照在设备上的绝对路径（导出时按字节流搬运）。 */
+    val path: String = "",
 )
 
 /** 容器内执行命令的结果。 */

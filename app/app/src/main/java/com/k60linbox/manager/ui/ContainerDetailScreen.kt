@@ -2,6 +2,8 @@
 package com.k60linbox.manager.ui
 
 import android.app.Application
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,6 +19,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.k60linbox.manager.net.MirrorPresets
+import com.k60linbox.manager.runtime.SnapshotInfo
 
 private val DETAIL_TABS = listOf("概览", "端口", "快照", "日志")
 
@@ -33,6 +36,15 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
     val snackbar = remember { SnackbarHostState() }
     var tab by remember { mutableIntStateOf(0) }
     var destroyAsk by remember { mutableStateOf(false) }
+    var pendingExport by remember { mutableStateOf<SnapshotInfo?>(null) }
+
+    val exporter = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri ->
+        val target = pendingExport
+        if (uri != null && target != null) vm.exportSnapshot(target, uri)
+        pendingExport = null
+    }
 
     LaunchedEffect(state.message) {
         val message = state.message
@@ -62,7 +74,14 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
             when (tab) {
                 0 -> OverviewTab(state, vm, onDestroy = { destroyAsk = true })
                 1 -> PortsTab(state, vm)
-                2 -> SnapshotsTab(state, vm)
+                2 -> SnapshotsTab(
+                    state = state,
+                    vm = vm,
+                    onExport = { snapshot ->
+                        pendingExport = snapshot
+                        exporter.launch("${snapshot.label}.img")
+                    },
+                )
                 else -> LogsTab(state, vm)
             }
         }
@@ -153,11 +172,13 @@ private fun OverviewTab(
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             MirrorPresets.all.forEach { preset ->
-                OutlinedButton(onClick = { vm.applyMirror(preset.id) }) { Text(preset.label) }
+                OutlinedButton(onClick = { vm.applyMirrorAndVerify(preset.id) }) { Text(preset.label) }
             }
         }
-        Text("换源不需要容器运行；首次改写会备份原文件，可再点「官方源」还原。",
-            style = MaterialTheme.typography.bodySmall)
+        Text(
+            "换源不需要容器运行；容器在跑时会顺手执行一次 apt-get update 验证，首次改写会备份原文件。",
+            style = MaterialTheme.typography.bodySmall,
+        )
 
         Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -268,7 +289,11 @@ private fun PortsTab(state: ContainerDetailViewModel.State, vm: ContainerDetailV
 // ---------------------------------------------------------------- 快照
 
 @Composable
-private fun SnapshotsTab(state: ContainerDetailViewModel.State, vm: ContainerDetailViewModel) {
+private fun SnapshotsTab(
+    state: ContainerDetailViewModel.State,
+    vm: ContainerDetailViewModel,
+    onExport: (SnapshotInfo) -> Unit,
+) {
     var label by remember { mutableStateOf("snap-1") }
 
     Column(Modifier.fillMaxSize()) {
@@ -307,6 +332,7 @@ private fun SnapshotsTab(state: ContainerDetailViewModel.State, vm: ContainerDet
                                 enabled = state.info?.running != true,
                                 onClick = { vm.restoreSnapshot(snapshot.label) },
                             ) { Text("恢复") }
+                            OutlinedButton(onClick = { onExport(snapshot) }) { Text("导出") }
                             OutlinedButton(onClick = { vm.removeSnapshot(snapshot.label) }) { Text("删除") }
                         }
                     }

@@ -22,7 +22,7 @@
 #          exec / shell / attach / set / resize / log
 #          snapshot / restore / snapshot-list / snapshot-rm
 #   网络   port add|del|list|sync
-#   其他   mirror / push / pull / autostart add|del|list|clear
+#   其他   mirror / push / pull / autostart add|del|list|clea
 
 set -u
 
@@ -445,7 +445,7 @@ cmd_snapshot_list() {
         _sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
         if [ "$J" = "1" ]; then
             [ -n "$_arr" ] && _arr="$_arr,"
-            _arr="$_arr{\"label\":\"$(json_escape "$_l")\",\"bytes\":$_sz}"
+            _arr="$_arr{\"label\":\"$(json_escape "$_l")\",\"bytes\":$_sz,\"path\":\"$(json_escape "$(snapshot_dir "$_name")/$_l.img")\"}"
         else
             printf '%s\t%s\n' "$_l" "$_sz"
         fi
@@ -1423,7 +1423,7 @@ k60-linbox - 最接近虚拟机的 Android 系统容器运行时
 网络   port add|del|list|sync <名> [协议 宿主端口 容器端口]
        mirror <名> <tuna|aliyun|ustc|official>
 文件   push <名> <宿主路径> <容器路径> | pull <名> <容器路径> <宿主路径>
-其他   autostart add|del|list|clear
+其他   autostart add|del|list|clea
 USAGE
 }
 
