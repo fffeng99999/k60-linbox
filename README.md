@@ -78,8 +78,18 @@ kernel/scripts/repack_boot.py   把新 Image 装回 boot v4，保留原 ramdisk
 magisk/                       Magisk 模块（system/bin 覆盖 + 防 bootloop）
 scripts/build_magisk.sh       组装 Magisk 包
 scripts/verify_device.sh      设备能力只读自检
-.github/workflows/            CI：打包模块 / 构建内核
+app/                          原生 Android 管理 App（Kotlin + Compose，CI 出 APK）
+.github/workflows/            CI：打包模块 / 构建内核 / 构建 App
 ```
+
+## 管理 App
+
+`app/` 是一个原生 Android 管理前端（Kotlin + Jetpack Compose），通过
+`su -c linbox ...` 操作容器：列表 / 启停 / 重启 / 状态 / 快照 / 新建 / 销毁，
+以及查看运行时能力自检与控制台输出。
+
+本地没有 Android SDK，APK 由 `.github/workflows/build-app.yml` 在 CI 构建，
+产物为 `app-debug.apk`。详见 [app/README.md](app/README.md)。
 
 ## 内核补丁
 

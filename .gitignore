@@ -16,6 +16,15 @@ tools/src/
 *.zip
 *.img
 
+# Android 工程构建产物
+app/.gradle/
+app/build/
+app/app/build/
+app/local.properties
+*.apk
+*.ap_
+*.dex
+
 # Python 缓存
 __pycache__/
 *.pyc
