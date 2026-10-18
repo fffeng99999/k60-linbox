@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /** 单个容器的详情：概览、端口、快照、日志。 */
 class ContainerDetailViewModel(app: Application, val containerName: String) : AndroidViewModel(app) {
