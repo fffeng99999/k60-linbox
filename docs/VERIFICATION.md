@@ -184,3 +184,41 @@ stop/destroy → loop=0 proc=0（零残留）
 - `IPC_NS` / `USER_NS` / `SYSVIPC` / `CGROUP_PIDS` 中究竟是哪一项（或组合）
   导致内核无法启动——需要逐项隔离构建。
 - systemd 作为容器 init 的完整可用性（依赖上面几项）。
+
+## 12. 容器网络打通（Android netd 策略路由）
+
+真实发行版（Ubuntu 24.04 base）跑起来后，容器**完全不通网**，逐层定位如下：
+
+1. 网桥端口状态 `forwarding`、双向 ARP 均已解析——二层正常。
+2. 把 `-i lbx0` 的 ACCEPT 规则**插到 FORWARD 链首**（原先追加在 Android 的
+   `tetherctrl_FORWARD` 等链之后，会被先 DROP）：宿主↔容器仍不通。
+3. 真正的根因在路由：`ip route get 172.30.0.10` 返回
+   **`via 192.168.58.1 dev wlan0 table wlan0`** —— Android netd 用
+   per-network 路由表 + fwmark/uid 规则做策略路由，把「外来」网桥的流量
+   （包括宿主自己发往容器的包）导向了 wlan0；同时 main 表没有默认路由，
+   容器出网也变成 `Network is unreachable`。
+
+**修法**（已固化进运行时 `setup_routing()`）：本网段不与任何 Android 网络重叠，
+因此可以按地址加规则，且不会影响 Android 自身流量：
+
+```text
+ip rule add to   172.30.0.0/24 lookup main priority 10010
+ip rule add from 172.30.0.0/24 lookup main priority 10011
+# main 表没有默认路由时，从已有的真实网络表借一条
+ip route add default via <真实网关> dev <真实网卡>
+```
+
+**结果**（已实测）：
+
+```text
+宿主 ping 容器        → 0% packet loss
+容器 TCP 到 1.1.1.1:443 → 通
+容器 DNS 解析          → 成功（archive.ubuntu.com）
+容器 apt-get update    → 能访问源（缺 gpgv 时才报验签警告）
+宿主自身上网           → 不受影响（仍通）
+```
+
+注意：`gpgv` 已在容器内安装（`/usr/bin/gpgv` 存在），但该最小 base 镜像上
+apt 仍报「gpgv required for verification, but neither seems installed」；
+装包可用 `apt-get install -y --allow-unauthenticated <包>`。这是 base 镜像的
+细节问题，不影响「容器有网 + 能装包」这一结论。

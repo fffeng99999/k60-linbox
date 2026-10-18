@@ -228,8 +228,38 @@ ensure_bridge() {
     iptables -t nat -C POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE \
         2>/dev/null || \
         iptables -t nat -A POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE
-    iptables -C FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i "$BRIDGE" -j ACCEPT
+    # FORWARD 放行必须插到链首：Android netd 的 tetherctrl_FORWARD 等链排在前面，
+    # 且 br_netfilter 让桥接流量也经过 FORWARD，若规则被追加到末尾就会被先 DROP，
+    # 表现为容器完全不通（连宿主↔容器 ping 都不通）。这里先清掉旧的放行再插到最前。
+    while iptables -D FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o "$BRIDGE" -j ACCEPT 2>/dev/null; do :; done
+    iptables -I FORWARD 1 -i "$BRIDGE" -j ACCEPT
+    iptables -I FORWARD 1 -o "$BRIDGE" -j ACCEPT
+    setup_routing
+}
+
+# 让与本网段相关的流量走 main 表，并给 main 表补一条默认路由。
+#
+# 设备实测：Android netd 用 per-network 路由表 + fwmark/uid 规则做策略路由，
+# 会把「外来」网桥的流量（包括宿主 ping 容器）导向 wlan0/rmnet，导致容器完全不通。
+# 由于本网段 172.30.0.0/24 不与任何 Android 网络重叠，按地址加规则是安全的：
+# Android 自身流量由更早的 fwmark/uid 规则命中，不受影响（实测宿主仍正常上网）。
+setup_routing() {
+    ip rule show 2>/dev/null | grep -q "to $SUBNET lookup main" || \
+        ip rule add to "$SUBNET" lookup main priority 10010 2>/dev/null || true
+    ip rule show 2>/dev/null | grep -q "from $SUBNET lookup main" || \
+        ip rule add from "$SUBNET" lookup main priority 10011 2>/dev/null || true
+
+    # main 表若没有默认路由，容器就无法出网；从已有的真实网络表里借一条。
+    ip route show table main 2>/dev/null | grep -q '^default' && return 0
+    _line="$(ip route show table all 2>/dev/null | grep '^default ' \
+             | grep -v dummy0 | grep ' via [0-9]' | head -n1)"
+    [ -n "$_line" ] || return 0
+    _gw="$(printf '%s\n' "$_line" | awk '{print $3}')"
+    _dev="$(printf '%s\n' "$_line" | awk '{print $5}')"
+    [ -n "$_gw" ] && [ -n "$_dev" ] && \
+        ip route add default via "$_gw" dev "$_dev" 2>/dev/null || true
+    return 0
 }
 
 setup_net() {
@@ -482,11 +512,21 @@ cmd_shell() {
     load_config "$_name"
     _pid="$(running_pid "$_name" 2>/dev/null)" || die "容器未运行: $_name"
     _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || echo "linbox-$_name")"
+    _root="/proc/$_pid/root"
     log "进入 $_name 的 shell（exit 退出）"
-    ip netns exec "$_ns" nsenter -t "$_pid" -m -u -i -p -n -- \
-        chroot "/proc/$_pid/root" /bin/sh -i 2>/dev/null || \
+    # 关键：用容器自己的 PATH/HOME/TERM，而不是宿主 Android 的环境，
+    # 否则 ls/head 等会去宿主 /system/bin 里找而报 command not found。
+    if [ -x "$_root/usr/bin/env" ]; then
+        ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+            chroot "$_root" /usr/bin/env -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/root TERM="${TERM:-xterm}" LANG=C.UTF-8 \
+            /bin/sh -i && return
+    fi
+    ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+        chroot "$_root" /bin/sh -i 2>/dev/null || \
         ip netns exec "$_ns" nsenter -t "$_pid" -m -- \
-            chroot "/proc/$_pid/root" /bin/sh -i
+            chroot "$_root" /bin/sh -i
 }
 
 # ---------------------------------------------------------------- 快照

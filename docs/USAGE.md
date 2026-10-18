@@ -118,4 +118,7 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
   标签；运行时每次启动都会自动 `chcon`。若手工移动过镜像，执行
   `chcon u:object_r:shell_data_file:s0 <镜像>` 即可修复。
 - **容器内没有网络**：确认 `iptables` 可用、`ip_forward=1`（设备默认已为 1）。
+  运行时会自动把 `-i/-o <网桥>` 的 ACCEPT 插到 FORWARD 链首，并按地址给
+  `172.30.0.0/24` 加策略路由指向 main 表（Android netd 的 per-network 路由表
+  与 fwmark 规则会把外来网桥的流量导错，详见 docs/VERIFICATION.md 第 12 节）。
 - **`linbox caps` 显示 PID 命名空间 no**：属预期，打内核补丁后变为 yes。
