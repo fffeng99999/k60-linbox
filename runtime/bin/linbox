@@ -170,6 +170,34 @@ kill_container() {
     done
 }
 
+# 兜底回收：把所有「属于本容器」的残留进程杀干净。判据两条，任一命中即杀：
+#   1) /proc/<pid>/root 指向本容器挂载点——chroot 进镜像的进程（含历史上因 PID
+#      记录错误而变成 PPID=1 的孤儿 init）；
+#   2) /proc/<pid>/ns/mnt 与容器 init 的挂载命名空间相同的进程——`linbox attach` 起的
+#      nsenter/busybox script 就属于这一类：它们 root 仍是宿主 /，但**持有容器的挂载
+#      命名空间引用**，不杀掉就会让 stop 之后 loop 设备一直释放不掉。
+kill_stragglers() {
+    _name=$1
+    _mnt="$(cont_dir "$_name")/$MNT_NAME"
+    _nsref=""
+    _pidf="$RUN_DIR/$_name/pid"
+    if [ -f "$_pidf" ]; then
+        _rp="$(cat "$_pidf" 2>/dev/null || true)"
+        [ -n "$_rp" ] && _nsref="$(readlink "/proc/$_rp/ns/mnt" 2>/dev/null || true)"
+    fi
+    for _pd in /proc/[0-9]*; do
+        _p=${_pd#/proc/}
+        _r="$(readlink "$_pd/root" 2>/dev/null || true)"
+        case "$_r" in
+            "$_mnt"|"$_mnt"/*) kill -KILL "$_p" 2>/dev/null || true; continue ;;
+        esac
+        [ -n "$_nsref" ] || continue
+        _n="$(readlink "$_pd/ns/mnt" 2>/dev/null || true)"
+        [ "$_n" = "$_nsref" ] && kill -KILL "$_p" 2>/dev/null || true
+    done
+    return 0
+}
+
 # 释放指向本容器镜像的 loop 设备。容器命名空间销毁可能有延迟，故重试若干次。
 detach_loops() {
     _name=$1
@@ -772,13 +800,23 @@ cmd_enter() {
     mount -t proc proc "$_mnt/proc" 2>/dev/null || warn "挂载 /proc 失败"
     mount -t sysfs sysfs "$_mnt/sys" 2>/dev/null || warn "挂载 /sys 失败"
     mount -t tmpfs tmpfs "$_mnt/dev" 2>/dev/null || true
+    # mknod 默认给出 0660 root:root；而 apt 等工具会以非 root 沙箱用户（_apt）打开
+    # /dev/null，非 root 打不开就会报 "cannot create /dev/null: Permission denied"，
+    # 进而让 apt 误判 gpgv 未安装、拒绝验签。必须补成标准的 0666。
     for n in null zero full random urandom tty; do
         mknod "$_mnt/dev/$n" c $(_devnum "$n") 2>/dev/null || true
+        chmod 0666 "$_mnt/dev/$n" 2>/dev/null || true
     done
     mknod "$_mnt/dev/console" c 5 1 2>/dev/null || true
-    mkdir -p "$_mnt/dev/pts"
+    chmod 0600 "$_mnt/dev/console" 2>/dev/null || true
+    mkdir -p "$_mnt/dev/pts" "$_mnt/dev/shm"
     mount -t devpts devpts -o newinstance,mode=0620,ptmxmode=0666 "$_mnt/dev/pts" 2>/dev/null || true
+    mount -t tmpfs tmpfs "$_mnt/dev/shm" 2>/dev/null || true
     ln -sf pts/ptmx "$_mnt/dev/ptmx" 2>/dev/null || true
+    ln -sf /proc/self/fd "$_mnt/dev/fd" 2>/dev/null || true
+    ln -sf /proc/self/fd/0 "$_mnt/dev/stdin" 2>/dev/null || true
+    ln -sf /proc/self/fd/1 "$_mnt/dev/stdout" 2>/dev/null || true
+    ln -sf /proc/self/fd/2 "$_mnt/dev/stderr" 2>/dev/null || true
     mount -t tmpfs tmpfs "$_mnt/run" 2>/dev/null || true
     mount -t tmpfs tmpfs "$_mnt/tmp" 2>/dev/null || true
 
@@ -825,11 +863,14 @@ cmd_start() {
 
     # 后台子 shell：跑容器，容器退出后自己记录退出码与事件（供 App 做退出/崩溃通知）。
     # 用 stopping 标记区分「被 stop 主动停掉」与「自行退出/崩溃」。
+    # `exec </dev/null >> console.log 2>&1`：容器、unshare 与这个后台子 shell 都会持有
+    # 调用方的 stdin/stdout。若从 adb shell（或任何带 PTY 的终端）里执行 start，PTY 被
+    # 长期占着，调用方读不到 EOF 就会一直挂着。整条链在子 shell 一开始就重定向掉。
     rm -f "$_rd/stopping" "$_rd/exit"
     : > "$_rd/console.log"
     (
-        ip netns exec "linbox-$_name" unshare $_flags -- "$SELF" __enter "$_name" \
-            >> "$_rd/console.log" 2>&1
+        exec </dev/null >> "$_rd/console.log" 2>&1
+        ip netns exec "linbox-$_name" unshare $_flags -- "$SELF" __enter "$_name"
         _rc=$?
         if [ -f "$_rd/stopping" ]; then
             event container "stop $_name rc=$_rc"
@@ -845,12 +886,23 @@ cmd_start() {
     _launched=$!
     printf '%s\n' "$_launched" > "$_rd/launch"
 
-    # `unshare -p -f` 会再 fork 出容器内真正的 PID 1，要定位它的宿主 PID。
-    # 未启用 PID 命名空间时 unshare 直接 exec，没有子进程，此时沿用启动进程本身。
-    _cpid="$_launched"; _i=0
-    while [ "$_i" -lt 25 ]; do
-        _c="$(pgrep -P "$_launched" 2>/dev/null | head -n1)"
-        [ -n "$_c" ] && { _cpid="$_c"; break; }
+    # 定位容器内真正的 PID 1（宿主 PID）。启动链实测为：
+    #   (后台子 shell) → ip netns exec 的 fork → unshare(-p -f) → chroot 后的 init
+    # 只有「root 不再是宿主 /」的那个进程才是容器 PID 1。不能简单地「见到第一个子进程
+    # 就下钻、root 一变就停」：init 在 chroot 之前会先 fork 出子进程（如 sleep），
+    # 竞态下会误把 init 的子进程当成容器 PID 1。这里改为先记下整条祖先链，再取链上
+    # 第一个 root 已改变的进程，语义确定、不受生成顺序影响。
+    # 未启用 PID 命名空间时 unshare 直接 exec 进 __enter，同样能被这个判据命中。
+    _cpid="$_launched"; _chain="$_launched"; _i=0
+    while [ "$_i" -lt 60 ]; do
+        _c="$(pgrep -P "$_cpid" 2>/dev/null | head -n1)"
+        [ -n "$_c" ] && { _cpid="$_c"; _chain="$_chain $_c"; }
+        _found=""
+        for _q in $_chain; do
+            _r="$(readlink "/proc/$_q/root" 2>/dev/null || true)"
+            if [ -n "$_r" ] && [ "$_r" != "/" ]; then _found="$_q"; break; fi
+        done
+        [ -n "$_found" ] && { _cpid="$_found"; break; }
         sleep 0.2; _i=$((_i + 1))
     done
     printf '%s\n' "$_cpid" > "$_rd/pid"
@@ -890,6 +942,7 @@ cmd_stop() {
     fi
 
     kill_container "$_name" "$_pid" "$_lp"
+    kill_stragglers "$_name"
     teardown_net "$_name" "$_idx"
     teardown_cgroup "$_name"
     detach_loops "$_name"
@@ -945,6 +998,7 @@ cmd_destroy() {
     valid_name "$_name" || fail BAD_NAME "非法容器名: $_name"
     [ -d "$(cont_dir "$_name")" ] || fail NO_CONTAINER "容器不存在: $_name"
     running_pid "$_name" >/dev/null 2>&1 && { cmd_stop "$_name" >/dev/null 2>&1 || true; }
+    kill_stragglers "$_name"
     detach_loops "$_name"
     _pf="$(ports_file "$_name")"
     if [ -f "$_pf" ]; then

@@ -94,7 +94,14 @@ private fun TerminalView(
                 setBackgroundColor(Color.BLACK)
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                // 关键：WebView 默认不主动抢焦点，xterm.js 的 term.focus() 只聚焦 DOM 里的
+                // 隐藏 textarea，管不到 Android 侧的 View 焦点。于是硬件/软键盘的按键会
+                // 冒泡给 Compose，被默认聚焦的控件接走——真机实测在终端页按 ENTER 会激活
+                // 顶栏「返回」，把整个详情页弹掉，且字符根本进不了 PTY（表现为终端敲不进字）。
+                isFocusable = true
+                isFocusableInTouchMode = true
             }
+            webView.post { webView.requestFocus() }
 
             val assetLoader = WebViewAssetLoader.Builder()
                 .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))

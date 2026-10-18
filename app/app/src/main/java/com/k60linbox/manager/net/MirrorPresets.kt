@@ -7,7 +7,10 @@ package com.k60linbox.manager.net
  */
 object MirrorPresets {
 
-    const val DEFAULT = "tuna"
+    // 实测（2026-10-19，K60 + 设备侧代理环境）：清华 TUNA 对 pool/ 下的 .deb 返回
+    // 403 Forbidden，dists/ 却能正常拉取——表现为 apt-get update 正常但 install 全部失败。
+    // 阿里云同环境下 200。默认值因此从 tuna 改为 aliyun，仍可在设置里手动切回。
+    const val DEFAULT = "aliyun"
 
     data class Preset(val id: String, val label: String, val host: String)
 

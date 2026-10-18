@@ -254,3 +254,67 @@ sed 's|http://ports\.ubuntu\.com/ubuntu-ports|http://X/ubuntu-ports|g'    → �
 
 实测 `echo x > /proc/<pid>/root/root/txt` 与 `cp`、`tar` 均正常，因此
 `push` / `pull` / `mirror` / `ls` 在容器运行中一律走这条路，只有停止态才临时挂镜像。
+
+## 14. 容器内基础软件安装过程中定位并修复的四个缺陷（2026-10-19 实测）
+
+这一轮从「App 里对容器做什么都失败」出发，最终把 Ubuntu 24.04 容器从 112 个包
+补到 225 个包（apt 全程可用）。四个缺陷都在 `runtime/bin/linbox`，均已修复并上机复验。
+
+### 14.1 `run/pid` 记录的是 unshare 中间进程，不是容器 PID 1
+
+启动链实测为
+`(后台子 shell) → ip netns exec 的 fork → unshare(-p -f) → chroot 后的 init`，
+原实现只取 `pgrep -P <子 shell>` 的第一层子进程，拿到的是 **unshare**：
+
+```text
+$ ps -A -o PID,PPID,ARGS | grep -E 'unshare|init'
+17810     1 sh /system/bin/linbox start ubuntu24
+17811 17810 unshare -m -u -p -f -- /system/bin/linbox __enter ubuntu24
+17815 17811 sh /init                      ← 真正的容器 PID 1
+$ readlink /proc/17811/root   → /        ← 记录错了：unshare 的 root 还是宿主 /
+$ readlink /proc/17815/root   → /data/local/linbox/containers/ubuntu24/mnt
+```
+
+后果：`exec`/`shell`/`attach`/`status` 全部打在 unshare 上——`exec` 实际落在
+**Android 根目录**（表现为 `apt-get: inaccessible or not found`、没有 `/etc/os-release`），
+`stop` 也收不掉容器，残余 init 变 PPID=1 的孤儿。
+修法：沿子进程链记录祖先，取链上**第一个 root 不再是宿主 `/`** 的进程。
+注意不能写成「见到子进程就下钻、root 一变就停」——init 在 chroot 前会先 fork 出子进程
+（如 `sleep`），竞态下会误把 init 的子进程当成 PID 1（实测记录成了 `sleep` 的 PID）。
+
+### 14.2 `stop` / `destroy` 收不掉两类残留
+
+除 14.1 的孤儿 init 外，`linbox attach` 起的 `nsenter` + `busybox script` 在客户端
+被强杀（App 崩溃/被杀、`timeout` 打断）后会留下，且**它们持有容器的挂载命名空间引用**，
+于是 `stop` 之后 `losetup -a` 里堆着同一个 `disk.img` 的多个 loop（实测堆到 5 个）。
+修法：`kill_stragglers()` 双判据清理——`/proc/<pid>/root` 指向容器挂载点，
+**或** `/proc/<pid>/ns/mnt` 与容器 init 相同。复验：stop 后 loop=0、cgroup.procs 为空、
+容器根下无残留进程。
+
+### 14.3 `linbox start` 会挂住调用方（PTY 被容器长期占用）
+
+容器要一直跑，而 `unshare` / 容器进程 / 后台子 shell 都会继承调用方的
+stdin/stdout。从 `adb shell`（或任何带 PTY 的终端）里执行 `start` 后，
+调用方读不到 EOF 就一直挂着（实测卡满 2 分钟以上）。
+修法：后台子 shell 一开头就 `exec </dev/null >> console.log 2>&1`，整条链都不再持有 PTY。
+复验：`start` 4 秒内返回。
+
+### 14.4 `mknod` 出的设备节点是 0660，非 root 沙箱用户打不开 `/dev/null`
+
+`cmd_enter` 里 `mknod` 默认给出 `crw-rw---- root:root`。apt 会以沙箱用户 `_apt`
+打开 `/dev/null`，非 root 打不开时 dash 报
+`/usr/bin/apt-key: 95: cannot create /dev/null: Permission denied`，
+连带 `>/dev/null` 重定向失败的 `command -v gpgv` 判断也失败，最终表现为
+**「gpgv … seems not installed」而拒绝验签、装不了任何包**（网络其实是通的：
+`apt-get update` 能拉到 InRelease）。
+修法：设备节点补成标准权限（`null/zero/full/random/urandom/tty` → 0666，`console` → 0600），
+并补 `/dev/shm`（tmpfs）、`/dev/fd`、`/dev/stdin|stdout|stderr` 软链。
+复验：apt-get update rc=0，装包成功。
+
+### 14.5 附：镜像站可用性（环境相关，非代码缺陷）
+
+同一台设备上：`mirrors.tuna.tsinghua.edu.cn` 的 `dists/` 正常、`pool/` 下的 `.deb`
+一律 **403 Forbidden**（设备侧解析到 198.18.x.x，走的是本机代理出口）；
+`mirrors.aliyun.com` 与 `ports.ubuntu.com` 同环境 200。
+App 的默认镜像站因此由 tuna 改为 aliyun（仍可在设置里切换）。
+
