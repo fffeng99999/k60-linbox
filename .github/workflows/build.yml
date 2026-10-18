@@ -1,0 +1,66 @@
+name: build-k60-linbox
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck zip
+
+      - name: Syntax check the runtime
+        run: |
+          set -euxo pipefail
+          sh -n runtime/bin/linbox
+          # shellcheck 的告警不阻塞构建，但会打印出来供人工复核。
+          shellcheck -s sh runtime/bin/linbox || true
+
+      - name: Build Magisk package
+        run: |
+          set -euxo pipefail
+          chmod +x scripts/build_magisk.sh
+          ./scripts/build_magisk.sh "$PWD/out/k60-linbox-magisk.zip"
+          unzip -l out/k60-linbox-magisk.zip
+          test -s out/k60-linbox-magisk.zip
+          unzip -p out/k60-linbox-magisk.zip module.prop | grep -q '^id=k60_linbox$'
+          sha256sum out/k60-linbox-magisk.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: k60-linbox-magisk-${{ github.sha }}
+          path: out/k60-linbox-magisk.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            out/k60-linbox-magisk.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "k60-linbox $GITHUB_REF_NAME" \
+            --generate-notes

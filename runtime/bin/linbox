@@ -1,0 +1,508 @@
+#!/system/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# k60-linbox - 最接近虚拟机的 Android 系统容器运行时（设备端 CLI）。
+#
+# 不依赖 hypervisor，靠内核命名空间 + cgroup + loop 挂载让一个 Linux 发行版拥有：
+#   - 独立的根文件系统（每容器一张 ext4 磁盘镜像，经 loop 挂载）
+#   - 独立的网络命名空间（veth + 网桥 + NAT，自带 IP）
+#   - 独立的主机名（UTS 命名空间）
+#   - cgroup v2 内存限额与进程数限额
+#   - （打上 k60-linbox 内核补丁后）独立的 PID 命名空间，发行版自己的 init 以
+#     真正的 PID 1 运行，容器可独立启停/重启，体验最接近虚拟机。
+#
+# 数据全部位于 /data/local/linbox，不读取任何用户数据。
+# 已知限制：设备 /data 为 f2fs，内核不支持以 f2fs 作 overlay 的 upperdir，
+# 因此根文件系统用 ext4 镜像而非 overlayfs。
+#
+# 用法：su -c 'linbox <命令>'
+#   linbox caps                          运行时能力自检（只读）
+#   linbox base add <名> <rootfs目录>    登记一个用于生成磁盘镜像的根文件系统
+#   linbox base list
+#   linbox create <名> [--base 名] [--size 4G] [--host 名] [--ip 地址] [--mem 兆] [--init 路径]
+#   linbox list
+#   linbox start <名>
+#   linbox stop <名>
+#   linbox restart <名>
+#   linbox status [名]
+#   linbox shell <名>                    进入容器交互 shell
+#   linbox snapshot <名> <标签>
+#   linbox restore <名> <标签>
+#   linbox destroy <名>
+
+set -u
+
+LINBOX_DIR=${LINBOX_DIR:-/data/local/linbox}
+BASE_DIR="$LINBOX_DIR/base"
+CONT_DIR="$LINBOX_DIR/containers"
+RUN_DIR="$LINBOX_DIR/run"
+BRIDGE=${LINBOX_BRIDGE:-lbx0}
+GATEWAY=172.30.0.1
+SUBNET=172.30.0.0/24
+MNT_NAME=mnt
+
+log()  { printf '[linbox] %s\n' "$*"; }
+warn() { printf '[linbox] 警告: %s\n' "$*" >&2; }
+die()  { printf '[linbox] 错误: %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" = "0" ] || exec su -c "$0 $*"
+
+# 解析自身绝对路径，供容器内部递归调用（__enter）。
+case "$0" in
+    /*) SELF="$0" ;;
+    *)  SELF="$(command -v "$0" 2>/dev/null || printf '%s/%s' "$(pwd)" "$0")" ;;
+esac
+
+# ---------------------------------------------------------------- 能力自检
+
+ns_supported() {
+    if unshare "$1" -- true >/dev/null 2>&1; then echo yes; else echo no; fi
+}
+
+cmd_caps() {
+    printf '%-20s %s\n' '内核版本' "$(uname -r)"
+    printf '%-20s %s\n' 'arch' "$(uname -m)"
+    for f in -p -m -n -u; do
+        case "$f" in
+            -p) label='PID 命名空间' ;;
+            -m) label='挂载命名空间' ;;
+            -n) label='网络命名空间' ;;
+            -u) label='UTS 命名空间' ;;
+        esac
+        printf '%-20s %s\n' "$label" "$(ns_supported $f)"
+    done
+    if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+        printf '%-20s %s (%s)\n' 'cgroup v2' 'yes' \
+            "$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)"
+    else
+        printf '%-20s %s\n' 'cgroup v2' 'no'
+    fi
+    printf '%-20s %s\n' 'ext4 文件系统' \
+        "$(grep -qw ext4 /proc/filesystems && echo yes || echo no)"
+    printf '%-20s %s\n' 'mke2fs/losetup' \
+        "$(command -v mke2fs >/dev/null 2>&1 && command -v losetup >/dev/null 2>&1 && echo yes || echo no)"
+    printf '%-20s %s\n' 'iproute2' "$(ip -V 2>/dev/null | head -n1 || echo no)"
+    if ! ip link show >/dev/null 2>&1; then
+        warn "iproute2 不可用，容器网络将无法建立"
+    fi
+    if [ "$(ns_supported -p)" = no ]; then
+        warn "内核未启用 PID 命名空间：容器暂无独立 PID 1，需打内核补丁（见 kernel/）"
+    fi
+}
+
+# ---------------------------------------------------------------- 工具函数
+
+ensure_dirs() { mkdir -p "$BASE_DIR" "$CONT_DIR" "$RUN_DIR" 2>/dev/null; }
+valid_name() {
+    case "$1" in
+        ''|*[!a-zA-Z0-9_-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+cont_dir() { echo "$CONT_DIR/$1"; }
+run_dir()  { echo "$RUN_DIR/$1"; }
+
+load_config() {
+    CONF="$(cont_dir "$1")/config"
+    [ -f "$CONF" ] || die "容器不存在: $1"
+    # shellcheck disable=SC1090
+    . "$CONF"
+}
+
+save_config() {
+    _sc_file="$1"; shift
+    : > "$_sc_file"
+    for item in "$@"; do printf '%s\n' "$item" >> "$_sc_file"; done
+}
+
+running_pid() {
+    _rp="$RUN_DIR/$1/pid"
+    [ -f "$_rp" ] || return 1
+    _p="$(cat "$_rp" 2>/dev/null)"
+    [ -n "$_p" ] || return 1
+    [ -d "/proc/$_p" ] && { printf '%s\n' "$_p"; return 0; }
+    return 1
+}
+
+# ---------------------------------------------------------------- base 管理
+
+cmd_base() {
+    _sub=${1:-list}
+    case "$_sub" in
+        add)
+            _name=${2:-}; _dir=${3:-}
+            valid_name "$_name" || die "非法 base 名称"
+            [ -d "$_dir" ] || die "rootfs 目录不存在: $_dir"
+            mkdir -p "$BASE_DIR/$_name"
+            printf '%s\n' "$(cd "$_dir" && pwd)" > "$BASE_DIR/$_name/rootfs.path"
+            log "已登记 base: $_name -> $(cat "$BASE_DIR/$_name/rootfs.path")"
+            ;;
+        list)
+            for d in "$BASE_DIR"/*; do
+                [ -d "$d" ] || continue
+                printf '%s -> %s\n' "$(basename "$d")" \
+                    "$(cat "$d/rootfs.path" 2>/dev/null || echo '?')"
+            done
+            ;;
+        *) die "用法: linbox base add <名> <rootfs目录> | linbox base list" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 容器创建
+
+cmd_create() {
+    _name=${1:-}; shift || true
+    valid_name "$_name" || die "非法容器名: $_name"
+    [ -e "$(cont_dir "$_name")" ] && die "容器已存在: $_name"
+
+    _base=""; _host="linbox-$_name"; _ip=""; _mem="2048"; _init="/sbin/init"; _size="4G"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --base) _base=${2:-}; shift 2 ;;
+            --host) _host=${2:-}; shift 2 ;;
+            --ip)   _ip=${2:-};   shift 2 ;;
+            --mem)  _mem=${2:-};  shift 2 ;;
+            --init) _init=${2:-}; shift 2 ;;
+            --size) _size=${2:-}; shift 2 ;;
+            *) die "未知参数: $1" ;;
+        esac
+    done
+    [ -n "$_base" ] || die "必须用 --base <名> 指定根文件系统（见 linbox base list）"
+    _base_dir="$(cat "$BASE_DIR/$_base/rootfs.path" 2>/dev/null)" || die "base 不存在: $_base"
+    [ -d "$_base_dir" ] || die "base 目录已失效: $_base_dir"
+
+    _cd="$(cont_dir "$_name")"
+    mkdir -p "$_cd/snapshots" "$(run_dir "$_name")"
+
+    log "正在从 $_base_dir 生成 ext4 镜像（$_size）…"
+    truncate -s "$_size" "$_cd/disk.img" || die "无法创建镜像文件"
+    # mke2fs 的 -d 直接把 base 目录内容灌入镜像。
+    mke2fs -t ext4 -F -q -d "$_base_dir" "$_cd/disk.img" \
+        || die "mke2fs 生成镜像失败（base 目录可能大于 $_size）"
+
+    [ -n "$_ip" ] || _ip="$(auto_ip)"
+    save_config "$_cd/config" \
+        "BASE=$_base" \
+        "HOSTNAME=$_host" \
+        "INIT=$_init" \
+        "MEMORY_MB=$_mem" \
+        "IP=$_ip" \
+        "IMAGE=disk.img" \
+        "SIZE=$_size"
+    log "已创建容器 $_name (base=$_base host=$_host ip=$_ip mem=${_mem}MB size=$_size)"
+}
+
+auto_ip() {
+    _n=10
+    while [ "$_n" -lt 250 ]; do
+        _used=0
+        for c in "$CONT_DIR"/*/config; do
+            [ -f "$c" ] || continue
+            if grep -q "^IP=172\.30\.0\.$_n\$" "$c" 2>/dev/null; then _used=1; break; fi
+        done
+        [ "$_used" = 0 ] && { echo "172.30.0.$_n"; return; }
+        _n=$((_n + 1))
+    done
+    die "地址池已用完"
+}
+
+# ---------------------------------------------------------------- 网络
+
+veth_index() {
+    _i=0
+    for d in "$CONT_DIR"/*; do
+        [ -d "$d" ] || continue
+        _i=$((_i + 1))
+        [ "$(basename "$d")" = "$1" ] && { echo "$_i"; return; }
+    done
+    echo 0
+}
+
+ensure_bridge() {
+    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+        ip link add "$BRIDGE" type bridge || die "无法创建网桥 $BRIDGE"
+        ip addr add "$GATEWAY/24" dev "$BRIDGE"
+        ip link set "$BRIDGE" up
+        log "已创建网桥 $BRIDGE ($GATEWAY)"
+    fi
+    iptables -t nat -C POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE \
+        2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE
+    iptables -C FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$BRIDGE" -j ACCEPT
+}
+
+setup_net() {
+    _name=$1; _ip=$2; _idx=$3
+    _ns="linbox-$_name"
+    _h="vlinbox${_idx}"
+    _c="${_h}c"
+
+    ip netns list 2>/dev/null | grep -qx "$_ns" || ip netns add "$_ns" \
+        || die "无法创建网络命名空间 $_ns"
+
+    if ! ip link show "$_h" >/dev/null 2>&1; then
+        ip link add "$_h" type veth peer name "$_c" || die "无法创建 veth 对"
+        ip link set "$_c" netns "$_ns"
+        ip link set "$_h" master "$BRIDGE"
+        ip link set "$_h" up
+        ip netns exec "$_ns" ip addr add "$_ip/24" dev "$_c"
+        ip netns exec "$_ns" ip link set "$_c" up
+        ip netns exec "$_ns" ip link set lo up
+        ip netns exec "$_ns" ip route add default via "$GATEWAY"
+        log "容器 $_name 网络就绪: $_ip (ns=$_ns)"
+    fi
+}
+
+teardown_net() {
+    _name=$1; _idx=$2
+    ip netns del "linbox-$_name" 2>/dev/null || true
+    ip link del "vlinbox${_idx}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- cgroup
+
+setup_cgroup() {
+    _name=$1; _mem=$2
+    _cg="/sys/fs/cgroup/linbox_$_name"
+    [ -e /sys/fs/cgroup/cgroup.controllers ] || { echo ""; return 0; }
+    mkdir -p "$_cg" 2>/dev/null || { warn "无法创建 cgroup，跳过限额"; echo ""; return 0; }
+    if [ -f "$_cg/memory.max" ] && [ -n "$_mem" ]; then
+        printf '%s\n' "$((_mem * 1024 * 1024))" > "$_cg/memory.max" 2>/dev/null || true
+    fi
+    echo "$_cg"
+}
+
+teardown_cgroup() {
+    _cg="/sys/fs/cgroup/linbox_$1"
+    [ -d "$_cg" ] || return 0
+    if [ -f "$_cg/cgroup.procs" ]; then
+        for _p in $(cat "$_cg/cgroup.procs" 2>/dev/null); do
+            printf '%s\n' "$_p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+        done
+    fi
+    rmdir "$_cg" 2>/dev/null || true
+}
+
+# 结束容器内所有进程：以 cgroup 成员为准（可覆盖 unshare -p -f 派生出的 PID 1）。
+kill_container() {
+    _name=$1; _pid=$2
+    _cg="/sys/fs/cgroup/linbox_$_name"
+    if [ -f "$_cg/cgroup.procs" ]; then
+        for _p in $(cat "$_cg/cgroup.procs" 2>/dev/null); do
+            kill -TERM "$_p" 2>/dev/null || true
+        done
+        _i=0
+        while [ -s "$_cg/cgroup.procs" ] && [ "$_i" -lt 20 ]; do
+            sleep 0.5; _i=$((_i + 1))
+        done
+        for _p in $(cat "$_cg/cgroup.procs" 2>/dev/null); do
+            kill -KILL "$_p" 2>/dev/null || true
+        done
+    fi
+    # 兜底：记录到的启动进程（无 PID 命名空间时它就是容器进程本身）。
+    if [ -n "$_pid" ]; then
+        kill -TERM "$_pid" 2>/dev/null || true
+        _i=0
+        while [ -d "/proc/$_pid" ] && [ "$_i" -lt 20 ]; do
+            sleep 0.5; _i=$((_i + 1))
+        done
+        kill -KILL "$_pid" 2>/dev/null || true
+    fi
+}
+
+# ---------------------------------------------------------------- 容器进入（内部）
+
+cmd_enter() {
+    _name=$1
+    load_config "$_name"
+    _cd="$(cont_dir "$_name")"
+    _mnt="$_cd/$MNT_NAME"
+
+    mkdir -p "$_mnt"
+    # 设备实测：/data 为 f2fs，若镜像文件带 system_data_file 标签，loop 挂载会报
+    # I/O error；改为 shell_data_file 标签即可（仅给目录改标签无效，必须改文件）。
+    # 每次进入都重打一遍，避免开机 restorecon 把它改回去。
+    chcon u:object_r:shell_data_file:s0 "$_cd/$IMAGE" 2>/dev/null || true
+    # 在本命名空间内用 -o loop 直接挂载镜像：loop 设备随该挂载自动建立与释放，
+    # 避免在宿主预挂 loop、再到子命名空间挂载时踩到上一轮的残留 loop 设备。
+    mount -t ext4 -o loop "$_cd/$IMAGE" "$_mnt" || die "无法挂载磁盘镜像 $IMAGE"
+    mkdir -p "$_mnt/proc" "$_mnt/sys" "$_mnt/dev" "$_mnt/run" "$_mnt/tmp" 2>/dev/null
+
+    mount -t proc proc "$_mnt/proc" 2>/dev/null || warn "挂载 /proc 失败"
+    mount -t sysfs sysfs "$_mnt/sys" 2>/dev/null || warn "挂载 /sys 失败"
+    mount -t tmpfs tmpfs "$_mnt/dev" 2>/dev/null || true
+    for n in null zero full random urandom tty; do
+        mknod "$_mnt/dev/$n" c $(_devnum "$n") 2>/dev/null || true
+    done
+    mknod "$_mnt/dev/console" c 5 1 2>/dev/null || true
+    mkdir -p "$_mnt/dev/pts"
+    mount -t devpts devpts -o newinstance,mode=0620,ptmxmode=0666 \
+        "$_mnt/dev/pts" 2>/dev/null || true
+    ln -sf pts/ptmx "$_mnt/dev/ptmx" 2>/dev/null || true
+    mount -t tmpfs tmpfs "$_mnt/run" 2>/dev/null || true
+    mount -t tmpfs tmpfs "$_mnt/tmp" 2>/dev/null || true
+
+    hostname "$HOSTNAME" 2>/dev/null || true
+    log "进入容器 $_name: host=$HOSTNAME pid1=$([ "$$" = 1 ] && echo yes || echo no)"
+
+    exec chroot "$_mnt" "$INIT"
+}
+
+_devnum() {
+    case "$1" in
+        null)    echo "1 3" ;;
+        zero)    echo "1 5" ;;
+        full)    echo "1 7" ;;
+        random)  echo "1 8" ;;
+        urandom) echo "1 9" ;;
+        tty)     echo "5 0" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 启停
+
+cmd_start() {
+    _name=${1:-}
+    load_config "$_name"
+    running_pid "$_name" >/dev/null 2>&1 && die "容器已在运行: $_name"
+
+    _cd="$(cont_dir "$_name")"
+    mkdir -p "$(run_dir "$_name")" "$_cd/$MNT_NAME"
+
+    # 1) 网络与 cgroup。
+    ensure_bridge
+    _idx="$(veth_index "$_name")"
+    setup_net "$_name" "$IP" "$_idx"
+    _cg="$(setup_cgroup "$_name" "$MEMORY_MB")"
+    printf '%s\n' "linbox-$_name" > "$(run_dir "$_name")/netns"
+
+    # 3) 启动：ip netns exec 设定网络，unshare 出挂载/主机名(/PID)。
+    _flags="-m -u"
+    if [ "$(ns_supported -p)" = yes ]; then
+        _flags="$_flags -p -f"
+    else
+        warn "无 PID 命名空间，容器进程将不属于独立 PID 1"
+    fi
+
+    ip netns exec "linbox-$_name" unshare $_flags -- "$SELF" __enter "$_name" &
+    _launched=$!
+    printf '%s\n' "$_launched" > "$(run_dir "$_name")/pid"
+
+    # 把启动进程放进容器 cgroup；子进程随 fork 继承，从而覆盖容器内所有进程。
+    if [ -n "$_cg" ]; then
+        printf '%s\n' "$_launched" > "$_cg/cgroup.procs" 2>/dev/null || true
+    fi
+    sleep 1
+    if ! running_pid "$_name" >/dev/null 2>&1; then
+        warn "容器启动后立即退出，请检查 rootfs 的 $INIT 是否存在且可执行"
+    fi
+    log "容器 $_name 已启动 (host pid=$_launched)"
+}
+
+cmd_stop() {
+    _name=${1:-}
+    load_config "$_name"
+    _pid="$(running_pid "$_name" 2>/dev/null || echo '')"
+    _idx="$(veth_index "$_name")"
+
+    kill_container "$_name" "$_pid"
+    teardown_net "$_name" "$_idx"
+    teardown_cgroup "$_name"
+    # 兜底：清掉指向本容器镜像的残留 loop 设备（挂载失败时可能残留）。
+    for _l in $(losetup -a 2>/dev/null | grep -F "$(cont_dir "$_name")/$IMAGE" \
+                | cut -d: -f1); do
+        losetup -d "$_l" 2>/dev/null || true
+    done
+    rm -rf "$(run_dir "$_name")"
+    log "容器 $_name 已停止"
+}
+
+cmd_restart() { cmd_stop "${1:-}"; cmd_start "${1:-}"; }
+
+cmd_status() {
+    _name=${1:-}
+    if [ -z "$_name" ]; then cmd_list; return; fi
+    load_config "$_name"
+    if _pid="$(running_pid "$_name" 2>/dev/null)"; then
+        printf '%s: running (pid=%s ip=%s host=%s)\n' "$_name" "$_pid" "$IP" "$HOSTNAME"
+    else
+        printf '%s: stopped (ip=%s host=%s)\n' "$_name" "$IP" "$HOSTNAME"
+    fi
+}
+
+cmd_list() {
+    for d in "$CONT_DIR"/*; do
+        [ -d "$d" ] || continue
+        _n="$(basename "$d")"
+        if running_pid "$_n" >/dev/null 2>&1; then _s=running; else _s=stopped; fi
+        printf '%-20s %-8s\n' "$_n" "$_s"
+    done
+}
+
+cmd_shell() {
+    _name=${1:-}
+    load_config "$_name"
+    _pid="$(running_pid "$_name" 2>/dev/null)" || die "容器未运行: $_name"
+    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || echo "linbox-$_name")"
+    log "进入 $_name 的 shell（exit 退出）"
+    ip netns exec "$_ns" nsenter -t "$_pid" -m -u -i -p -n -- \
+        chroot "/proc/$_pid/root" /bin/sh -i 2>/dev/null || \
+        ip netns exec "$_ns" nsenter -t "$_pid" -m -- \
+            chroot "/proc/$_pid/root" /bin/sh -i
+}
+
+# ---------------------------------------------------------------- 快照
+
+cmd_snapshot() {
+    _name=${1:-}; _label=${2:-}
+    load_config "$_name"
+    running_pid "$_name" >/dev/null 2>&1 && die "请先停止容器再建快照（保证镜像一致）"
+    _sd="$(cont_dir "$_name")/snapshots"
+    mkdir -p "$_sd"
+    cp "$(cont_dir "$_name")/$IMAGE" "$_sd/$_label.img" || die "快照失败"
+    log "已创建快照: $_label（镜像副本）"
+}
+
+cmd_restore() {
+    _name=${1:-}; _label=${2:-}
+    load_config "$_name"
+    running_pid "$_name" >/dev/null 2>&1 && die "请先停止容器再恢复"
+    _sd="$(cont_dir "$_name")/snapshots"
+    [ -f "$_sd/$_label.img" ] || die "快照不存在: $_label"
+    cp "$_sd/$_label.img" "$(cont_dir "$_name")/$IMAGE" || die "恢复失败"
+    log "已从快照 $_label 恢复"
+}
+
+cmd_destroy() {
+    _name=${1:-}
+    running_pid "$_name" >/dev/null 2>&1 && cmd_stop "$_name"
+    rm -rf "$(cont_dir "$_name")" "$(run_dir "$_name")"
+    log "已销毁容器 $_name"
+}
+
+# ---------------------------------------------------------------- 入口
+
+usage() { sed -n '18,32p' "$0"; }
+
+ensure_dirs
+
+_cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$_cmd" in
+    caps)                       cmd_caps ;;
+    base)                       cmd_base "$@" ;;
+    create)                     cmd_create "$@" ;;
+    list)                       cmd_list ;;
+    start)                      cmd_start "${1:?容器名}" ;;
+    stop)                       cmd_stop "${1:?容器名}" ;;
+    restart)                    cmd_restart "${1:?容器名}" ;;
+    status)                     cmd_status "${1:-}" ;;
+    shell)                      cmd_shell "${1:?容器名}" ;;
+    snapshot)                   cmd_snapshot "${1:?容器名}" "${2:?快照标签}" ;;
+    restore)                    cmd_restore "${1:?容器名}" "${2:?快照标签}" ;;
+    destroy)                    cmd_destroy "${1:?容器名}" ;;
+    __enter)                    cmd_enter "${1:?容器名}" ;;
+    ''|-h|--help|help)          usage ;;
+    *) die "未知命令: $_cmd（用 linbox --help）" ;;
+esac

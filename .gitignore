@@ -1,0 +1,21 @@
+# 本地构建输出与 CI 产物，禁止提交
+out/
+.work/
+artifacts/
+
+# 设备能力报告与容器状态，禁止提交
+reports/
+
+# 原始启动分区备份与设备固件，禁止提交
+k60-stock-backup/
+tools/device-dump/
+tools/src/
+
+# 内核模块与安装包
+*.ko
+*.zip
+*.img
+
+# Python 缓存
+__pycache__/
+*.pyc
