@@ -3,108 +3,119 @@
 #
 # k60-linbox - 最接近虚拟机的 Android 系统容器运行时（设备端 CLI）。
 #
-# 不依赖 hypervisor，靠内核命名空间 + cgroup + loop 挂载让一个 Linux 发行版拥有：
-#   - 独立的根文件系统（每容器一张 ext4 磁盘镜像，经 loop 挂载）
-#   - 独立的网络命名空间（veth + 网桥 + NAT，自带 IP）
-#   - 独立的主机名（UTS 命名空间）
-#   - cgroup v2 内存限额与进程数限额
-#   - （打上 k60-linbox 内核补丁后）独立的 PID 命名空间，发行版自己的 init 以
-#     真正的 PID 1 运行，容器可独立启停/重启，体验最接近虚拟机。
+# 设计要点：
+#   - 每容器一张 ext4 磁盘镜像，容器自己的挂载命名空间里用 mount -o loop 挂载
+#   - 独立网络命名空间（veth + 网桥 + NAT + 针对 Android netd 的策略路由修正）
+#   - 独立主机名（UTS）与（打过内核补丁后）独立 PID 命名空间
+#   - cgroup v2 内存限额
+#   - 数据全部在 /data/local/linbox，不读取任何用户数据
 #
-# 数据全部位于 /data/local/linbox，不读取任何用户数据。
-# 已知限制：设备 /data 为 f2fs，内核不支持以 f2fs 作 overlay 的 upperdir，
-# 因此根文件系统用 ext4 镜像而非 overlayfs。
+# 机器可读输出：任意命令加 --json（或环境变量 LINBOX_JSON=1）即输出单行 JSON：
+#   成功 {"ok":true,"data":...}
+#   失败 {"ok":false,"error":{"code":"...","message":"..."}}
+# 日志与警告一律走 stderr，保证 stdout 只有数据。
 #
-# 用法：su -c 'linbox <命令>'
-#   linbox caps                          运行时能力自检（只读）
-#   linbox base add <名> <rootfs目录>    登记一个用于生成磁盘镜像的根文件系统
-#   linbox base list
-#   linbox create <名> [--base 名] [--size 4G] [--host 名] [--ip 地址] [--mem 兆] [--init 路径]
-#   linbox list
-#   linbox start <名>
-#   linbox stop <名>
-#   linbox restart <名>
-#   linbox status [名]
-#   linbox shell <名>                    进入容器交互 shell
-#   linbox snapshot <名> <标签>
-#   linbox restore <名> <标签>
-#   linbox destroy <名>
+# 用法：su -c 'linbox <命令> [参数]'
+#   引导   doctor / version / caps
+#   发行版 base add|import|list|remove
+#   容器   create / list / start / stop / restart / status / destroy
+#          exec / shell / attach / set / resize / log
+#          snapshot / restore / snapshot-list / snapshot-rm
+#   网络   port add|del|list|sync
+#   其他   mirror / push / pull / autostart add|del|list|clear
 
 set -u
+
+LINBOX_VERSION="1.0.0"
+LINBOX_PROTOCOL="1"
 
 LINBOX_DIR=${LINBOX_DIR:-/data/local/linbox}
 BASE_DIR="$LINBOX_DIR/base"
 CONT_DIR="$LINBOX_DIR/containers"
 RUN_DIR="$LINBOX_DIR/run"
+AUTOSTART_FILE="$LINBOX_DIR/autostart"
+EVENTS_FILE="$LINBOX_DIR/events.log"
+MODULE_DIR="/data/adb/modules/k60_linbox"
 BRIDGE=${LINBOX_BRIDGE:-lbx0}
 GATEWAY=172.30.0.1
 SUBNET=172.30.0.0/24
 MNT_NAME=mnt
 
-log()  { printf '[linbox] %s\n' "$*"; }
+J=0                 # 是否 JSON 模式
+[ "${LINBOX_JSON:-0}" = "1" ] && J=1
+
+# ---------------------------------------------------------------- 日志与契约
+
+log()  { printf '[linbox] %s\n' "$*" >&2; }
 warn() { printf '[linbox] 警告: %s\n' "$*" >&2; }
-die()  { printf '[linbox] 错误: %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" = "0" ] || exec su -c "$0 $*"
-
-# 解析自身绝对路径，供容器内部递归调用（__enter）。
-case "$0" in
-    /*) SELF="$0" ;;
-    *)  SELF="$(command -v "$0" 2>/dev/null || printf '%s/%s' "$(pwd)" "$0")" ;;
-esac
-
-# ---------------------------------------------------------------- 能力自检
-
-ns_supported() {
-    if unshare "$1" -- true >/dev/null 2>&1; then echo yes; else echo no; fi
-}
-
-cmd_caps() {
-    printf '%-20s %s\n' '内核版本' "$(uname -r)"
-    printf '%-20s %s\n' 'arch' "$(uname -m)"
-    for f in -p -m -n -u; do
-        case "$f" in
-            -p) label='PID 命名空间' ;;
-            -m) label='挂载命名空间' ;;
-            -n) label='网络命名空间' ;;
-            -u) label='UTS 命名空间' ;;
-        esac
-        printf '%-20s %s\n' "$label" "$(ns_supported $f)"
-    done
-    if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
-        printf '%-20s %s (%s)\n' 'cgroup v2' 'yes' \
-            "$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)"
+# 统一错误出口：带机器可读 code，JSON 模式下不打印人类文本。
+fail() {
+    _code=$1
+    shift
+    _msg="$*"
+    if [ "$J" = "1" ]; then
+        printf '{"ok":false,"error":{"code":"%s","message":"%s"}}\n' \
+            "$(json_escape "$_code")" "$(json_escape "$_msg")"
     else
-        printf '%-20s %s\n' 'cgroup v2' 'no'
+        printf '[linbox] 错误(%s): %s\n' "$_code" "$_msg" >&2
     fi
-    printf '%-20s %s\n' 'ext4 文件系统' \
-        "$(grep -qw ext4 /proc/filesystems && echo yes || echo no)"
-    printf '%-20s %s\n' 'mke2fs/losetup' \
-        "$(command -v mke2fs >/dev/null 2>&1 && command -v losetup >/dev/null 2>&1 && echo yes || echo no)"
-    printf '%-20s %s\n' 'iproute2' "$(ip -V 2>/dev/null | head -n1 || echo no)"
-    if ! ip link show >/dev/null 2>&1; then
-        warn "iproute2 不可用，容器网络将无法建立"
-    fi
-    if [ "$(ns_supported -p)" = no ]; then
-        warn "内核未启用 PID 命名空间：容器暂无独立 PID 1，需打内核补丁（见 kernel/）"
-    fi
+    exit 1
 }
 
-# ---------------------------------------------------------------- 工具函数
+json_escape() {
+    printf '%s' "${1:-}" | tr -d '\r' | tr '\n' ' ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# 在 JSON 模式下打印数据对象；非 JSON 模式由各命令自己打印人类可读文本。
+emit() {
+    [ "$J" = "1" ] || return 0
+    printf '{"ok":true,"data":%s}\n' "${1:-null}"
+}
+
+# 追加一条事件（供 App 轮询做退出/崩溃通知）。
+event() {
+    mkdir -p "$LINBOX_DIR" 2>/dev/null
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$2" \
+        >> "$EVENTS_FILE" 2>/dev/null || true
+}
+
+# 是否带了某个开关
+has_flag() {
+    _want=$1
+    shift
+    for _a in "$@"; do [ "$_a" = "$_want" ] && return 0; done
+    return 1
+}
+
+# 从参数里取 --key value
+opt_val() {
+    _key=$1
+    shift
+    while [ $# -gt 1 ]; do
+        if [ "$1" = "$_key" ]; then printf '%s' "$2"; return 0; fi
+        shift
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- 通用工具
 
 ensure_dirs() { mkdir -p "$BASE_DIR" "$CONT_DIR" "$RUN_DIR" 2>/dev/null; }
+
 valid_name() {
     case "$1" in
         ''|*[!a-zA-Z0-9_-]*) return 1 ;;
         *) return 0 ;;
     esac
 }
-cont_dir() { echo "$CONT_DIR/$1"; }
-run_dir()  { echo "$RUN_DIR/$1"; }
+
+cont_dir() { printf '%s' "$CONT_DIR/$1"; }
+run_dir()  { printf '%s' "$RUN_DIR/$1"; }
 
 load_config() {
     CONF="$(cont_dir "$1")/config"
-    [ -f "$CONF" ] || die "容器不存在: $1"
+    [ -f "$CONF" ] || fail NO_CONTAINER "容器不存在: $1"
     # shellcheck disable=SC1090
     . "$CONF"
 }
@@ -115,6 +126,7 @@ save_config() {
     for item in "$@"; do printf '%s\n' "$item" >> "$_sc_file"; done
 }
 
+# 容器存活判定：优先用 run/pid（容器 PID 1 的宿主 PID）。
 running_pid() {
     _rp="$RUN_DIR/$1/pid"
     [ -f "$_rp" ] || return 1
@@ -124,198 +136,12 @@ running_pid() {
     return 1
 }
 
-# ---------------------------------------------------------------- base 管理
-
-cmd_base() {
-    _sub=${1:-list}
-    case "$_sub" in
-        add)
-            _name=${2:-}; _dir=${3:-}
-            valid_name "$_name" || die "非法 base 名称"
-            [ -d "$_dir" ] || die "rootfs 目录不存在: $_dir"
-            mkdir -p "$BASE_DIR/$_name"
-            printf '%s\n' "$(cd "$_dir" && pwd)" > "$BASE_DIR/$_name/rootfs.path"
-            log "已登记 base: $_name -> $(cat "$BASE_DIR/$_name/rootfs.path")"
-            ;;
-        list)
-            for d in "$BASE_DIR"/*; do
-                [ -d "$d" ] || continue
-                printf '%s -> %s\n' "$(basename "$d")" \
-                    "$(cat "$d/rootfs.path" 2>/dev/null || echo '?')"
-            done
-            ;;
-        *) die "用法: linbox base add <名> <rootfs目录> | linbox base list" ;;
-    esac
+# 是否支持某个 unshare 命名空间（-p / -m / -n / -u）
+ns_supported() {
+    if unshare "$1" -- true >/dev/null 2>&1; then echo yes; else echo no; fi
 }
 
-# ---------------------------------------------------------------- 容器创建
-
-cmd_create() {
-    _name=${1:-}; shift || true
-    valid_name "$_name" || die "非法容器名: $_name"
-    [ -e "$(cont_dir "$_name")" ] && die "容器已存在: $_name"
-
-    _base=""; _host="linbox-$_name"; _ip=""; _mem="2048"; _init="/sbin/init"; _size="4G"
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --base) _base=${2:-}; shift 2 ;;
-            --host) _host=${2:-}; shift 2 ;;
-            --ip)   _ip=${2:-};   shift 2 ;;
-            --mem)  _mem=${2:-};  shift 2 ;;
-            --init) _init=${2:-}; shift 2 ;;
-            --size) _size=${2:-}; shift 2 ;;
-            *) die "未知参数: $1" ;;
-        esac
-    done
-    [ -n "$_base" ] || die "必须用 --base <名> 指定根文件系统（见 linbox base list）"
-    _base_dir="$(cat "$BASE_DIR/$_base/rootfs.path" 2>/dev/null)" || die "base 不存在: $_base"
-    [ -d "$_base_dir" ] || die "base 目录已失效: $_base_dir"
-
-    _cd="$(cont_dir "$_name")"
-    mkdir -p "$_cd/snapshots" "$(run_dir "$_name")"
-
-    log "正在从 $_base_dir 生成 ext4 镜像（$_size）…"
-    truncate -s "$_size" "$_cd/disk.img" || die "无法创建镜像文件"
-    # mke2fs 的 -d 直接把 base 目录内容灌入镜像。
-    mke2fs -t ext4 -F -q -d "$_base_dir" "$_cd/disk.img" \
-        || die "mke2fs 生成镜像失败（base 目录可能大于 $_size）"
-
-    [ -n "$_ip" ] || _ip="$(auto_ip)"
-    save_config "$_cd/config" \
-        "BASE=$_base" \
-        "HOSTNAME=$_host" \
-        "INIT=$_init" \
-        "MEMORY_MB=$_mem" \
-        "IP=$_ip" \
-        "IMAGE=disk.img" \
-        "SIZE=$_size"
-    log "已创建容器 $_name (base=$_base host=$_host ip=$_ip mem=${_mem}MB size=$_size)"
-}
-
-auto_ip() {
-    _n=10
-    while [ "$_n" -lt 250 ]; do
-        _used=0
-        for c in "$CONT_DIR"/*/config; do
-            [ -f "$c" ] || continue
-            if grep -q "^IP=172\.30\.0\.$_n\$" "$c" 2>/dev/null; then _used=1; break; fi
-        done
-        [ "$_used" = 0 ] && { echo "172.30.0.$_n"; return; }
-        _n=$((_n + 1))
-    done
-    die "地址池已用完"
-}
-
-# ---------------------------------------------------------------- 网络
-
-veth_index() {
-    _i=0
-    for d in "$CONT_DIR"/*; do
-        [ -d "$d" ] || continue
-        _i=$((_i + 1))
-        [ "$(basename "$d")" = "$1" ] && { echo "$_i"; return; }
-    done
-    echo 0
-}
-
-ensure_bridge() {
-    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
-        ip link add "$BRIDGE" type bridge || die "无法创建网桥 $BRIDGE"
-        ip addr add "$GATEWAY/24" dev "$BRIDGE"
-        ip link set "$BRIDGE" up
-        log "已创建网桥 $BRIDGE ($GATEWAY)"
-    fi
-    iptables -t nat -C POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE \
-        2>/dev/null || \
-        iptables -t nat -A POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE
-    # FORWARD 放行必须插到链首：Android netd 的 tetherctrl_FORWARD 等链排在前面，
-    # 且 br_netfilter 让桥接流量也经过 FORWARD，若规则被追加到末尾就会被先 DROP，
-    # 表现为容器完全不通（连宿主↔容器 ping 都不通）。这里先清掉旧的放行再插到最前。
-    while iptables -D FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D FORWARD -o "$BRIDGE" -j ACCEPT 2>/dev/null; do :; done
-    iptables -I FORWARD 1 -i "$BRIDGE" -j ACCEPT
-    iptables -I FORWARD 1 -o "$BRIDGE" -j ACCEPT
-    setup_routing
-}
-
-# 让与本网段相关的流量走 main 表，并给 main 表补一条默认路由。
-#
-# 设备实测：Android netd 用 per-network 路由表 + fwmark/uid 规则做策略路由，
-# 会把「外来」网桥的流量（包括宿主 ping 容器）导向 wlan0/rmnet，导致容器完全不通。
-# 由于本网段 172.30.0.0/24 不与任何 Android 网络重叠，按地址加规则是安全的：
-# Android 自身流量由更早的 fwmark/uid 规则命中，不受影响（实测宿主仍正常上网）。
-setup_routing() {
-    ip rule show 2>/dev/null | grep -q "to $SUBNET lookup main" || \
-        ip rule add to "$SUBNET" lookup main priority 10010 2>/dev/null || true
-    ip rule show 2>/dev/null | grep -q "from $SUBNET lookup main" || \
-        ip rule add from "$SUBNET" lookup main priority 10011 2>/dev/null || true
-
-    # main 表若没有默认路由，容器就无法出网；从已有的真实网络表里借一条。
-    ip route show table main 2>/dev/null | grep -q '^default' && return 0
-    _line="$(ip route show table all 2>/dev/null | grep '^default ' \
-             | grep -v dummy0 | grep ' via [0-9]' | head -n1)"
-    [ -n "$_line" ] || return 0
-    _gw="$(printf '%s\n' "$_line" | awk '{print $3}')"
-    _dev="$(printf '%s\n' "$_line" | awk '{print $5}')"
-    [ -n "$_gw" ] && [ -n "$_dev" ] && \
-        ip route add default via "$_gw" dev "$_dev" 2>/dev/null || true
-    return 0
-}
-
-setup_net() {
-    _name=$1; _ip=$2; _idx=$3
-    _ns="linbox-$_name"
-    _h="vlinbox${_idx}"
-    _c="${_h}c"
-
-    ip netns list 2>/dev/null | grep -qx "$_ns" || ip netns add "$_ns" \
-        || die "无法创建网络命名空间 $_ns"
-
-    if ! ip link show "$_h" >/dev/null 2>&1; then
-        ip link add "$_h" type veth peer name "$_c" || die "无法创建 veth 对"
-        ip link set "$_c" netns "$_ns"
-        ip link set "$_h" master "$BRIDGE"
-        ip link set "$_h" up
-        ip netns exec "$_ns" ip addr add "$_ip/24" dev "$_c"
-        ip netns exec "$_ns" ip link set "$_c" up
-        ip netns exec "$_ns" ip link set lo up
-        ip netns exec "$_ns" ip route add default via "$GATEWAY"
-        log "容器 $_name 网络就绪: $_ip (ns=$_ns)"
-    fi
-}
-
-teardown_net() {
-    _name=$1; _idx=$2
-    ip netns del "linbox-$_name" 2>/dev/null || true
-    ip link del "vlinbox${_idx}" 2>/dev/null || true
-}
-
-# ---------------------------------------------------------------- cgroup
-
-setup_cgroup() {
-    _name=$1; _mem=$2
-    _cg="/sys/fs/cgroup/linbox_$_name"
-    [ -e /sys/fs/cgroup/cgroup.controllers ] || { echo ""; return 0; }
-    mkdir -p "$_cg" 2>/dev/null || { warn "无法创建 cgroup，跳过限额"; echo ""; return 0; }
-    if [ -f "$_cg/memory.max" ] && [ -n "$_mem" ]; then
-        printf '%s\n' "$((_mem * 1024 * 1024))" > "$_cg/memory.max" 2>/dev/null || true
-    fi
-    echo "$_cg"
-}
-
-teardown_cgroup() {
-    _cg="/sys/fs/cgroup/linbox_$1"
-    [ -d "$_cg" ] || return 0
-    if [ -f "$_cg/cgroup.procs" ]; then
-        for _p in $(cat "$_cg/cgroup.procs" 2>/dev/null); do
-            printf '%s\n' "$_p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
-        done
-    fi
-    rmdir "$_cg" 2>/dev/null || true
-}
-
-# 结束容器内所有进程：以 cgroup 成员为准（覆盖 unshare -p -f 派生出的 PID 1），
-# 再补杀启动进程与容器 PID 1。
+# 结束容器内所有进程：以 cgroup 成员为准（覆盖 unshare -p -f 派生出的 PID 1）。
 kill_container() {
     _name=$1; _pid=$2; _lp=$3
     _cg="/sys/fs/cgroup/linbox_$_name"
@@ -352,17 +178,586 @@ detach_loops() {
     while [ "$_r" -lt 6 ]; do
         _ls="$(losetup -a 2>/dev/null | grep -F "$_img" | cut -d: -f1)"
         [ -z "$_ls" ] && return 0
-        for _l in $_ls; do
-            losetup -d "$_l" 2>/dev/null || true
-        done
+        for _l in $_ls; do losetup -d "$_l" 2>/dev/null || true; done
         sleep 1
         _r=$((_r + 1))
     done
     return 0
 }
 
-# ---------------------------------------------------------------- 容器进入（内部）
+# ---------------------------------------------------------------- 发行版 base
 
+base_path_of() { printf '%s' "$BASE_DIR/$1/rootfs"; }
+
+base_add() {
+    _name=$1; _dir=$2
+    valid_name "$_name" || fail BAD_NAME "非法 base 名称"
+    [ -d "$_dir" ] || fail BAD_ARGS "rootfs 目录不存在: $_dir"
+    mkdir -p "$BASE_DIR/$_name"
+    printf '%s\n' "$(cd "$_dir" && pwd)" > "$BASE_DIR/$_name/rootfs.path"
+    log "已登记 base: $_name -> $(cat "$BASE_DIR/$_name/rootfs.path")"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"path\":\"$(json_escape "$(cat "$BASE_DIR/$_name/rootfs.path")")\"}"
+}
+
+# 探测归档格式：gzip / xz / 其它(按 tar 处理)
+archive_kind() {
+    _m="$(head -c 6 "$1" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
+    case "$_m" in
+        1f8b*) echo gzip ;;
+        fd377a585a00*) echo xz ;;
+        *) echo tar ;;
+    esac
+}
+
+base_import() {
+    _archive=""; _name=""; _dir=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) _name=${2:-}; shift 2 ;;
+            --dir)  _dir=${2:-};  shift 2 ;;
+            --) shift; _archive=${1:-}; shift || true ;;
+            *) [ -z "$_archive" ] && _archive=$1; shift ;;
+        esac
+    done
+    [ -n "$_archive" ] || fail BAD_ARGS "用法: linbox base import <归档> --name <名> [--dir <目录>]"
+    [ -f "$_archive" ] || fail BAD_ARGS "归档不存在: $_archive"
+    [ -n "$_name" ] || _name="$(basename "$_archive" | sed 's/\.tar\..*$//; s/\.tar$//')"
+    valid_name "$_name" || fail BAD_NAME "非法 base 名称: $_name"
+    [ -n "$_dir" ] || _dir="$(base_path_of "$_name")"
+
+    _kind="$(archive_kind "$_archive")"
+    log "导入 $_archive（格式 $_kind）-> $_dir"
+    mkdir -p "$_dir"
+
+    case "$_kind" in
+        gzip) tar -xzf "$_archive" -C "$_dir" 2>/dev/null || \
+                  tar -xzf "$_archive" -C "$_dir" --exclude=./dev --exclude=./proc --exclude=./sys ;;
+        xz)   if busboy_has unxz; then
+                  busybox unxz -c "$_archive" | tar -xf - -C "$_dir" 2>/dev/null || \
+                      fail EXTRACT_FAILED "xz 解包失败"
+              else
+                  fail TOOL_MISSING "设备缺少 busybox unxz，无法解 xz"
+              fi ;;
+        *)    tar -xf "$_archive" -C "$_dir" 2>/dev/null || \
+                  fail EXTRACT_FAILED "tar 解包失败" ;;
+    esac
+
+    # /dev /proc /sys 由运行时在容器内重新挂载，这里清空并把目录补回来
+    for _d in dev proc sys; do
+        rm -rf "$_dir/$_d" 2>/dev/null || true
+        mkdir -p "$_dir/$_d" 2>/dev/null || true
+    done
+    if [ ! -d "$_dir/usr" ] && [ ! -d "$_dir/bin" ]; then
+        fail EXTRACT_FAILED "解包结果不像 rootfs（缺少 /usr 与 /bin）"
+    fi
+
+    mkdir -p "$BASE_DIR/$_name"
+    printf '%s\n' "$_dir" > "$BASE_DIR/$_name/rootfs.path"
+    chmod 0755 "$_dir" 2>/dev/null || true
+    event base "import $_name"
+    log "base 就绪: $_name -> $_dir"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"path\":\"$(json_escape "$_dir")\"}"
+}
+
+# 列出引用某个 base 的容器
+base_refs() {
+    _name=$1; _out=""
+    for c in "$CONT_DIR"/*/config; do
+        [ -f "$c" ] || continue
+        if grep -q "^BASE=$_name\$" "$c" 2>/dev/null; then
+            _out="$_out$(basename "$(dirname "$c")") "
+        fi
+    done
+    printf '%s' "$_out"
+}
+
+base_list() {
+    _arr=""
+    for d in "$BASE_DIR"/*; do
+        [ -d "$d" ] || continue
+        _n="$(basename "$d")"
+        _p="$(cat "$d/rootfs.path" 2>/dev/null || echo '?')"
+        _refs="$(base_refs "$_n")"
+        if [ "$J" = "1" ]; then
+            [ -n "$_arr" ] && _arr="$_arr,"
+            _arr="$_arr{\"name\":\"$(json_escape "$_n")\",\"path\":\"$(json_escape "$_p")\",\"containers\":\"$(json_escape "$_refs")\"}"
+        else
+            printf '%s -> %s\n' "$_n" "$_p"
+        fi
+    done
+    [ "$J" = "1" ] && emit "[$_arr]"
+    return 0
+}
+
+base_remove() {
+    _name=$1; shift || true
+    valid_name "$_name" || fail BAD_NAME "非法 base 名称"
+    [ -f "$BASE_DIR/$_name/rootfs.path" ] || fail NO_BASE "base 不存在: $_name"
+    _refs="$(base_refs "$_name")"
+    if [ -n "$_refs" ] && ! has_flag --force "$@"; then
+        fail BASE_IN_USE "仍有容器引用该 base: $_refs（加 --force 强制删除）"
+    fi
+    _p="$(cat "$BASE_DIR/$_name/rootfs.path" 2>/dev/null)"
+    rm -rf "$BASE_DIR/$_name" 2>/dev/null || true
+    # 只删除运行时自己导入的 rootfs（位于 LINBOX_DIR 之下），避免误删用户自己的目录
+    case "$_p" in
+        "$LINBOX_DIR"/*) rm -rf "$_p" 2>/dev/null || true ;;
+    esac
+    log "已删除 base: $_name"
+    emit "{\"name\":\"$(json_escape "$_name")\"}"
+}
+
+cmd_base() {
+    _sub=${1:-list}
+    shift || true
+    case "$_sub" in
+        add)    base_add "${1:?base 名称}" "${2:?rootfs 目录}" ;;
+        import) base_import "$@" ;;
+        list)   base_list ;;
+        remove|rm) base_remove "$@" ;;
+        *) fail BAD_ARGS "用法: linbox base add|import|list|remove" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 存储（镜像/挂载/扩容/快照）
+
+busboy_has() { busybox --list 2>/dev/null | grep -qx "$1"; }
+
+# 在宿主命名空间把容器镜像挂到 containers/<名>/mnt（停止态文件操作/换源/扩容前用）
+image_mount_host() {
+    _name=$1
+    _cd="$(cont_dir "$_name")"
+    mkdir -p "$_cd/$MNT_NAME"
+    mountpoint -q "$_cd/$MNT_NAME" 2>/dev/null && return 0
+    chcon u:object_r:shell_data_file:s0 "$_cd/$IMAGE" 2>/dev/null || true
+    mount -t ext4 -o loop "$_cd/$IMAGE" "$_cd/$MNT_NAME" || \
+        fail MOUNT_FAILED "无法挂载镜像 $IMAGE"
+}
+
+image_umount_host() {
+    _name=$1
+    _cd="$(cont_dir "$_name")"
+    umount "$_cd/$MNT_NAME" 2>/dev/null || true
+}
+
+cmd_resize() {
+    _name=${1:-}
+    shift || true
+    _size="$(opt_val --size "$@" 2>/dev/null || true)"
+    load_config "$_name"
+    [ -n "$_size" ] || fail BAD_ARGS "用法: linbox resize <名> --size 8G"
+    running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再扩容"
+
+    _cd="$(cont_dir "$_name")"
+    _img="$_cd/$IMAGE"
+    _cur="$(stat -c %s "$_img" 2>/dev/null || echo 0)"
+    log "当前镜像 $_cur 字节，目标 $_size"
+
+    if has_flag --dry-run "$@"; then
+        if busboy_has resize2fs || command -v resize2fs >/dev/null 2>&1; then
+            emit "{\"feasible\":true,\"current\":$_cur}"
+        else
+            emit "{\"feasible\":false,\"reason\":\"TOOL_MISSING\"}"
+        fi
+        return 0
+    fi
+
+    # 只支持扩容（缩容有丢数据风险）
+    truncate -s "$_size" "$_img" || fail RESIZE_FAILED "truncate 失败"
+    _new="$(stat -c %s "$_img" 2>/dev/null || echo 0)"
+    if [ "$_new" -lt "$_cur" ]; then
+        truncate -s "$_cur" "$_img" 2>/dev/null || true
+        fail RESIZE_SHRINK_UNSUPPORTED "不支持缩容"
+    fi
+
+    _LD="$(losetup -f 2>/dev/null)" || fail TOOL_MISSING "没有空闲 loop 设备"
+    losetup "$_LD" "$_img" || { truncate -s "$_cur" "$_img" 2>/dev/null; fail RESIZE_FAILED "losetup 失败"; }
+
+    _e2fsck="$(command -v e2fsck 2>/dev/null || true)"
+    _resize2fs="$(command -v resize2fs 2>/dev/null || true)"
+    [ -n "$_e2fsck" ] || { _e2fsck="$(command -v /data/local/linbox/bin/e2fsck 2>/dev/null || true)"; }
+    [ -n "$_resize2fs" ] || { _resize2fs="$(command -v /data/local/linbox/bin/resize2fs 2>/dev/null || true)"; }
+    if [ -z "$_e2fsck" ] || [ -z "$_resize2fs" ]; then
+        losetup -d "$_LD" 2>/dev/null || true
+        truncate -s "$_cur" "$_img" 2>/dev/null || true
+        fail TOOL_MISSING "缺少 e2fsck/resize2fs（需 Magisk 模块内置）"
+    fi
+
+    "$_e2fsck" -f -p "$_LD" >/dev/null 2>&1 || true
+    if ! "$_resize2fs" "$_LD" >/dev/null 2>&1; then
+        losetup -d "$_LD" 2>/dev/null || true
+        fail RESIZE_FAILED "resize2fs 失败（镜像已回滚为原大小）"
+    fi
+    losetup -d "$_LD" 2>/dev/null || true
+    save_config_replacing "$_cd/config" SIZE "$_size"
+    event container "resize $_name $_size"
+    log "扩容完成: $_name -> $_size"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"size\":\"$(json_escape "$_size")\",\"bytes\":$_new}"
+}
+
+# 改配置里的某一项（保留其它行）
+save_config_replacing() {
+    _file=$1; _key=$2; _val=$3
+    _tmp="$_file.tmp"
+    : > "$_tmp"
+    _found=0
+    while IFS= read -r _line; do
+        case "$_line" in
+            "$_key"=*) printf '%s=%s\n' "$_key" "$_val" >> "$_tmp"; _found=1 ;;
+            *) printf '%s\n' "$_line" >> "$_tmp" ;;
+        esac
+    done < "$_file"
+    [ "$_found" = 1 ] || printf '%s=%s\n' "$_key" "$_val" >> "$_tmp"
+    mv "$_tmp" "$_file"
+}
+
+snapshot_dir() { printf '%s' "$(cont_dir "$1")/snapshots"; }
+
+cmd_snapshot() {
+    _name=${1:-}; _label=${2:-}
+    load_config "$_name"
+    running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再建快照"
+    _sd="$(snapshot_dir "$_name")"
+    mkdir -p "$_sd"
+    cp "$(cont_dir "$_name")/$IMAGE" "$_sd/$_label.img" || fail SNAPSHOT_FAILED "快照失败"
+    log "已创建快照: $_label"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"label\":\"$(json_escape "$_label")\"}"
+}
+
+cmd_restore() {
+    _name=${1:-}; _label=${2:-}
+    load_config "$_name"
+    running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再恢复"
+    _sd="$(snapshot_dir "$_name")"
+    [ -f "$_sd/$_label.img" ] || fail NO_SNAPSHOT "快照不存在: $_label"
+    cp "$_sd/$_label.img" "$(cont_dir "$_name")/$IMAGE" || fail RESTORE_FAILED "恢复失败"
+    log "已从快照 $_label 恢复"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"label\":\"$(json_escape "$_label")\"}"
+}
+
+cmd_snapshot_list() {
+    _name=${1:-}
+    load_config "$_name"
+    _arr=""
+    for f in "$(snapshot_dir "$_name")"/*.img; do
+        [ -f "$f" ] || continue
+        _l="$(basename "$f" .img)"
+        _sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+        if [ "$J" = "1" ]; then
+            [ -n "$_arr" ] && _arr="$_arr,"
+            _arr="$_arr{\"label\":\"$(json_escape "$_l")\",\"bytes\":$_sz}"
+        else
+            printf '%s\t%s\n' "$_l" "$_sz"
+        fi
+    done
+    [ "$J" = "1" ] && emit "[$_arr]"
+    return 0
+}
+
+cmd_snapshot_rm() {
+    _name=${1:-}; _label=${2:-}
+    load_config "$_name"
+    [ -f "$(snapshot_dir "$_name")/$_label.img" ] || fail NO_SNAPSHOT "快照不存在: $_label"
+    rm -f "$(snapshot_dir "$_name")/$_label.img"
+    log "已删除快照: $_label"
+    emit "{\"label\":\"$(json_escape "$_label")\"}"
+}
+
+# ---------------------------------------------------------------- 网络（veth/网桥/策略路由）
+
+# veth 设备序号：用容器在 CONT_DIR 里的稳定序号做 vlinbox<N>
+veth_index() {
+    _i=0
+    for d in "$CONT_DIR"/*; do
+        [ -d "$d" ] || continue
+        _i=$((_i + 1))
+        [ "$(basename "$d")" = "$1" ] && { printf '%s\n' "$_i"; return 0; }
+    done
+    printf '0\n'
+}
+
+# 网桥 + NAT + FORWARD 放行。FORWARD 必须插链首：Android netd 的 tetherctrl_FORWARD
+# 等链排在前面，且 br_netfilter 让桥接流量也经过 FORWARD，追加到末尾会先被 DROP，
+# 表现为容器完全不通（详见 docs/VERIFICATION.md §12）。
+ensure_bridge() {
+    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+        ip link add "$BRIDGE" type bridge || fail NET_BRIDGE "无法创建网桥 $BRIDGE"
+        ip addr add "$GATEWAY/24" dev "$BRIDGE" 2>/dev/null || true
+        ip link set "$BRIDGE" up
+        log "已创建网桥 $BRIDGE ($GATEWAY)"
+    fi
+    iptables -t nat -C POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE
+    while iptables -D FORWARD -i "$BRIDGE" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o "$BRIDGE" -j ACCEPT 2>/dev/null; do :; done
+    iptables -I FORWARD 1 -i "$BRIDGE" -j ACCEPT
+    iptables -I FORWARD 1 -o "$BRIDGE" -j ACCEPT
+    setup_routing
+}
+
+# 让本网段流量走 main 表，并给 main 补一条默认路由。
+# 本网段 172.30.0.0/24 不与任何 Android 网络重叠，故按地址加规则是安全的。
+setup_routing() {
+    ip rule show 2>/dev/null | grep -q "to $SUBNET lookup main" || \
+        ip rule add to "$SUBNET" lookup main priority 10010 2>/dev/null || true
+    ip rule show 2>/dev/null | grep -q "from $SUBNET lookup main" || \
+        ip rule add from "$SUBNET" lookup main priority 10011 2>/dev/null || true
+    ip route show table main 2>/dev/null | grep -q '^default' && return 0
+    _line="$(ip route show table all 2>/dev/null | grep '^default ' \
+             | grep -v dummy0 | grep ' via [0-9]' | head -n1)"
+    [ -n "$_line" ] || return 0
+    _gw="$(printf '%s\n' "$_line" | awk '{print $3}')"
+    _dev="$(printf '%s\n' "$_line" | awk '{print $5}')"
+    [ -n "$_gw" ] && [ -n "$_dev" ] && \
+        ip route add default via "$_gw" dev "$_dev" 2>/dev/null || true
+    return 0
+}
+
+setup_net() {
+    _name=$1; _ip=$2; _idx=$3
+    _ns="linbox-$_name"
+    _h="vlinbox${_idx}"
+    _c="${_h}c"
+    ip netns list 2>/dev/null | grep -qx "$_ns" || \
+        ip netns add "$_ns" || fail NET_NS "无法创建网络命名空间 $_ns"
+    if ! ip link show "$_h" >/dev/null 2>&1; then
+        ip link add "$_h" type veth peer name "$_c" || fail NET_VETH "无法创建 veth 对"
+        ip link set "$_c" netns "$_ns"
+        ip link set "$_h" master "$BRIDGE"
+        ip link set "$_h" up
+        ip netns exec "$_ns" ip addr add "$_ip/24" dev "$_c"
+        ip netns exec "$_ns" ip link set "$_c" up
+        ip netns exec "$_ns" ip link set lo up
+        ip netns exec "$_ns" ip route add default via "$GATEWAY"
+        log "容器 $_name 网络就绪: $_ip (ns=$_ns)"
+    fi
+}
+
+teardown_net() {
+    _name=$1; _idx=$2
+    ip netns del "linbox-$_name" 2>/dev/null || true
+    ip link del "vlinbox${_idx}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- cgroup v2 内存限额
+
+setup_cgroup() {
+    _name=$1; _mem=$2
+    _cg="/sys/fs/cgroup/linbox_$_name"
+    [ -e /sys/fs/cgroup/cgroup.controllers ] || { printf '\n'; return 0; }
+    mkdir -p "$_cg" 2>/dev/null || { warn "无法创建 cgroup，跳过内存限额"; printf '\n'; return 0; }
+    if [ -f "$_cg/memory.max" ] && [ -n "$_mem" ]; then
+        printf '%s\n' "$((_mem * 1024 * 1024))" > "$_cg/memory.max" 2>/dev/null || true
+    fi
+    printf '%s\n' "$_cg"
+}
+
+teardown_cgroup() {
+    _cg="/sys/fs/cgroup/linbox_$1"
+    [ -d "$_cg" ] || return 0
+    if [ -f "$_cg/cgroup.procs" ]; then
+        for _p in $(cat "$_cg/cgroup.procs" 2>/dev/null); do
+            printf '%s\n' "$_p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+        done
+    fi
+    rmdir "$_cg" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- 端口转发（DNAT + FORWARD）
+#
+# 映射持久化在 containers/<名>/ports，每行「协议 宿主端口 容器端口」。
+# 网络切换时 netd 会重刷 iptables，靠 linbox port sync 重放。
+
+ports_file() { printf '%s' "$(cont_dir "$1")/ports"; }
+
+cont_ip_of() {
+    grep '^IP=' "$(cont_dir "$1")/config" 2>/dev/null | head -n1 | cut -d= -f2
+}
+
+port_apply() {
+    _name=$1; _proto=$2; _hp=$3; _cp=$4
+    _ip="$(cont_ip_of "$_name")"
+    [ -n "$_ip" ] || fail BAD_ARGS "容器 $_name 没有 IP 配置"
+    iptables -t nat -D PREROUTING -p "$_proto" --dport "$_hp" \
+        -j DNAT --to-destination "$_ip:$_cp" 2>/dev/null || true
+    iptables -t nat -A PREROUTING -p "$_proto" --dport "$_hp" \
+        -j DNAT --to-destination "$_ip:$_cp" || fail NET_IPTABLES "添加 DNAT 规则失败"
+    iptables -D FORWARD -p "$_proto" -d "$_ip" --dport "$_cp" -j ACCEPT 2>/dev/null || true
+    iptables -I FORWARD 1 -p "$_proto" -d "$_ip" --dport "$_cp" -j ACCEPT
+}
+
+port_unapply() {
+    _name=$1; _proto=$2; _hp=$3; _cp=$4
+    _ip="$(cont_ip_of "$_name")"
+    [ -n "$_ip" ] || return 0
+    iptables -t nat -D PREROUTING -p "$_proto" --dport "$_hp" \
+        -j DNAT --to-destination "$_ip:$_cp" 2>/dev/null || true
+    iptables -D FORWARD -p "$_proto" -d "$_ip" --dport "$_cp" -j ACCEPT 2>/dev/null || true
+}
+
+port_add() {
+    _name=${1:-}; _proto=${2:-tcp}; _hp=${3:-}; _cp=${4:-}
+    [ -n "$_name" ] && [ -n "$_hp" ] && [ -n "$_cp" ] || \
+        fail BAD_ARGS "用法: linbox port add <名> <tcp|udp> <宿主端口> <容器端口>"
+    load_config "$_name"
+    case "$_proto" in tcp|udp) ;; *) fail BAD_ARGS "协议只支持 tcp/udp" ;; esac
+    _pf="$(ports_file "$_name")"
+    grep -qx "$_proto $_hp $_cp" "$_pf" 2>/dev/null && \
+        fail PORT_EXISTS "该映射已存在: $_proto 宿主 $_hp -> 容器 $_cp"
+    printf '%s %s %s\n' "$_proto" "$_hp" "$_cp" >> "$_pf"
+    port_apply "$_name" "$_proto" "$_hp" "$_cp"
+    event port "add $_name $_proto $_hp $_cp"
+    log "已添加端口映射: $_proto 宿主 $_hp -> 容器 $_cp"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"proto\":\"$_proto\",\"hostPort\":$_hp,\"containerPort\":$_cp}"
+}
+
+port_del() {
+    _name=${1:-}; _proto=${2:-tcp}; _hp=${3:-}; _cp=${4:-}
+    [ -n "$_name" ] && [ -n "$_hp" ] && [ -n "$_cp" ] || \
+        fail BAD_ARGS "用法: linbox port del <名> <tcp|udp> <宿主端口> <容器端口>"
+    load_config "$_name"
+    _pf="$(ports_file "$_name")"
+    [ -f "$_pf" ] || fail NO_PORT "该容器没有端口映射"
+    _tmp="$_pf.tmp"; : > "$_tmp"; _found=0
+    while IFS= read -r _l; do
+        if [ "$_l" = "$_proto $_hp $_cp" ]; then
+            _found=1
+        else
+            printf '%s\n' "$_l" >> "$_tmp"
+        fi
+    done < "$_pf"
+    mv "$_tmp" "$_pf"
+    [ "$_found" = 1 ] || fail NO_PORT "映射不存在: $_proto 宿主 $_hp -> 容器 $_cp"
+    port_unapply "$_name" "$_proto" "$_hp" "$_cp"
+    event port "del $_name $_proto $_hp $_cp"
+    log "已删除端口映射: $_proto 宿主 $_hp -> 容器 $_cp"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"proto\":\"$_proto\",\"hostPort\":$_hp,\"containerPort\":$_cp}"
+}
+
+port_list() {
+    _name=${1:-}
+    load_config "$_name"
+    _pf="$(ports_file "$_name")"
+    _arr=""
+    if [ -f "$_pf" ]; then
+        while IFS= read -r _l; do
+            [ -n "$_l" ] || continue
+            _proto="$(printf '%s' "$_l" | awk '{print $1}')"
+            _hp="$(printf '%s' "$_l" | awk '{print $2}')"
+            _cp="$(printf '%s' "$_l" | awk '{print $3}')"
+            if [ "$J" = "1" ]; then
+                [ -n "$_arr" ] && _arr="$_arr,"
+                _arr="$_arr{\"proto\":\"$_proto\",\"hostPort\":$_hp,\"containerPort\":$_cp}"
+            else
+                printf '%s\t宿主 %s -> 容器 %s\n' "$_proto" "$_hp" "$_cp"
+            fi
+        done < "$_pf"
+    fi
+    [ "$J" = "1" ] && emit "[$_arr]"
+    return 0
+}
+
+# 重放全部映射（start 时自动调用；网络切换后也可手动调用）
+port_sync() {
+    _name=${1:-}
+    load_config "$_name"
+    _pf="$(ports_file "$_name")"
+    _n=0
+    if [ -f "$_pf" ]; then
+        while IFS= read -r _l; do
+            [ -n "$_l" ] || continue
+            # shellcheck disable=SC2086
+            port_apply "$_name" $_l < /dev/null
+            _n=$((_n + 1))
+        done < "$_pf"
+    fi
+    log "已重放 $_n 条端口映射（$_name）"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"synced\":$_n}"
+}
+
+cmd_port() {
+    _sub=${1:-list}
+    shift || true
+    case "$_sub" in
+        add)        port_add "$@" ;;
+        del|rm)     port_del "$@" ;;
+        list)       port_list "${1:-}" ;;
+        sync)       port_sync "${1:-}" ;;
+        *) fail BAD_ARGS "用法: linbox port add|del|list|sync" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 容器创建
+
+cmd_create() {
+    _name=${1:-}; shift || true
+    valid_name "$_name" || fail BAD_NAME "非法容器名: $_name"
+    [ -e "$(cont_dir "$_name")" ] && fail CONTAINER_EXISTS "容器已存在: $_name"
+
+    _base=""; _host="linbox-$_name"; _ip=""; _mem="2048"; _init="/sbin/init"; _size="4G"
+    while [ $# -gt 0 ]; do
+        _k=$1; shift
+        case "$_k" in
+            --base)  _base=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            --host)  _host=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            --ip)    _ip=${1:-};   [ $# -gt 0 ] && shift || true ;;
+            --mem)   _mem=${1:-};  [ $# -gt 0 ] && shift || true ;;
+            --init)  _init=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            --size)  _size=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            *) fail BAD_ARGS "未知参数: $_k" ;;
+        esac
+    done
+
+    [ -n "$_base" ] || fail BAD_ARGS "必须用 --base <名> 指定根文件系统（见 linbox base list）"
+    _base_dir="$(cat "$BASE_DIR/$_base/rootfs.path" 2>/dev/null || true)"
+    [ -n "$_base_dir" ] || fail NO_BASE "base 不存在: $_base"
+    [ -d "$_base_dir" ] || fail NO_BASE "base 目录已失效: $_base_dir"
+
+    _cd="$(cont_dir "$_name")"
+    mkdir -p "$_cd/snapshots" "$(run_dir "$_name")"
+
+    log "正在从 $_base_dir 生成 ext4 镜像（$_size）…"
+    truncate -s "$_size" "$_cd/disk.img" || fail CREATE_FAILED "无法创建镜像文件"
+    # mke2fs 的 -d 直接把 base 目录内容灌入镜像。
+    mke2fs -t ext4 -F -q -d "$_base_dir" "$_cd/disk.img" || \
+        fail CREATE_FAILED "mke2fs 生成镜像失败（base 目录可能大于 $_size）"
+
+    [ -n "$_ip" ] || _ip="$(auto_ip)"
+    save_config "$_cd/config" \
+        "BASE=$_base" \
+        "HOSTNAME=$_host" \
+        "INIT=$_init" \
+        "MEMORY_MB=$_mem" \
+        "IP=$_ip" \
+        "IMAGE=disk.img" \
+        "SIZE=$_size"
+    event container "create $_name"
+    log "已创建容器 $_name (base=$_base host=$_host ip=$_ip mem=${_mem}MB size=$_size)"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"base\":\"$(json_escape "$_base")\",\"host\":\"$(json_escape "$_host")\",\"ip\":\"$(json_escape "$_ip")\",\"memoryMB\":$_mem,\"size\":\"$(json_escape "$_size")\"}"
+}
+
+# 从 172.30.0.10 起找一个没被占用的地址
+auto_ip() {
+    _n=10
+    while [ "$_n" -lt 250 ]; do
+        _used=0
+        for c in "$CONT_DIR"/*/config; do
+            [ -f "$c" ] || continue
+            if grep -q "^IP=172\.30\.0\.$_n\$" "$c" 2>/dev/null; then _used=1; break; fi
+        done
+        [ "$_used" = 0 ] && { printf '172.30.0.%s\n' "$_n"; return 0; }
+        _n=$((_n + 1))
+    done
+    fail NO_IP "地址池已用完"
+}
+
+# ---------------------------------------------------------------- 容器进入（内部命令 __enter）
+
+# 在容器自己的挂载命名空间里挂载镜像并 chroot 进入，作为容器 PID 1 运行 init。
+# 设备实测两条硬约束（见 docs/VERIFICATION.md §9）：
+#   1) 镜像文件必须是 shell_data_file 标签，否则 mount -o loop 报 I/O error；
+#      只给目录改标签无效，必须改文件，且每次进入都重打一遍（开机 restorecon 会改回）。
+#   2) 必须在容器命名空间内 mount -o loop（宿主预挂 loop 再到子命名空间挂载会 EIO）。
 cmd_enter() {
     _name=$1
     load_config "$_name"
@@ -370,13 +765,8 @@ cmd_enter() {
     _mnt="$_cd/$MNT_NAME"
 
     mkdir -p "$_mnt"
-    # 设备实测：/data 为 f2fs，若镜像文件带 system_data_file 标签，loop 挂载会报
-    # I/O error；改为 shell_data_file 标签即可（仅给目录改标签无效，必须改文件）。
-    # 每次进入都重打一遍，避免开机 restorecon 把它改回去。
     chcon u:object_r:shell_data_file:s0 "$_cd/$IMAGE" 2>/dev/null || true
-    # 在本命名空间内用 -o loop 直接挂载镜像：loop 设备随该挂载自动建立与释放，
-    # 避免在宿主预挂 loop、再到子命名空间挂载时踩到上一轮的残留 loop 设备。
-    mount -t ext4 -o loop "$_cd/$IMAGE" "$_mnt" || die "无法挂载磁盘镜像 $IMAGE"
+    mount -t ext4 -o loop "$_cd/$IMAGE" "$_mnt" || fail MOUNT_FAILED "无法挂载磁盘镜像 $IMAGE"
     mkdir -p "$_mnt/proc" "$_mnt/sys" "$_mnt/dev" "$_mnt/run" "$_mnt/tmp" 2>/dev/null
 
     mount -t proc proc "$_mnt/proc" 2>/dev/null || warn "挂载 /proc 失败"
@@ -387,69 +777,83 @@ cmd_enter() {
     done
     mknod "$_mnt/dev/console" c 5 1 2>/dev/null || true
     mkdir -p "$_mnt/dev/pts"
-    mount -t devpts devpts -o newinstance,mode=0620,ptmxmode=0666 \
-        "$_mnt/dev/pts" 2>/dev/null || true
+    mount -t devpts devpts -o newinstance,mode=0620,ptmxmode=0666 "$_mnt/dev/pts" 2>/dev/null || true
     ln -sf pts/ptmx "$_mnt/dev/ptmx" 2>/dev/null || true
     mount -t tmpfs tmpfs "$_mnt/run" 2>/dev/null || true
     mount -t tmpfs tmpfs "$_mnt/tmp" 2>/dev/null || true
 
     hostname "$HOSTNAME" 2>/dev/null || true
-    log "进入容器 $_name: host=$HOSTNAME pid1=$([ "$$" = 1 ] && echo yes || echo no)"
-
+    log "进入容器 $_name: host=$HOSTNAME pid1=$([ "$$" = 1 ] && printf yes || printf no)"
     exec chroot "$_mnt" "$INIT"
 }
 
 _devnum() {
     case "$1" in
-        null)    echo "1 3" ;;
-        zero)    echo "1 5" ;;
-        full)    echo "1 7" ;;
-        random)  echo "1 8" ;;
-        urandom) echo "1 9" ;;
-        tty)     echo "5 0" ;;
+        null)    printf '1 3\n' ;;
+        zero)    printf '1 5\n' ;;
+        full)    printf '1 7\n' ;;
+        random)  printf '1 8\n' ;;
+        urandom) printf '1 9\n' ;;
+        tty)     printf '5 0\n' ;;
     esac
 }
 
-# ---------------------------------------------------------------- 启停
+# ---------------------------------------------------------------- 启停与列表
 
 cmd_start() {
     _name=${1:-}
     load_config "$_name"
-    running_pid "$_name" >/dev/null 2>&1 && die "容器已在运行: $_name"
+    running_pid "$_name" >/dev/null 2>&1 && fail ALREADY_RUNNING "容器已在运行: $_name"
 
     _cd="$(cont_dir "$_name")"
-    mkdir -p "$(run_dir "$_name")" "$_cd/$MNT_NAME"
+    _rd="$(run_dir "$_name")"
+    mkdir -p "$_rd" "$_cd/$MNT_NAME"
 
-    # 1) 网络与 cgroup。
     ensure_bridge
     _idx="$(veth_index "$_name")"
     setup_net "$_name" "$IP" "$_idx"
     _cg="$(setup_cgroup "$_name" "$MEMORY_MB")"
-    printf '%s\n' "linbox-$_name" > "$(run_dir "$_name")/netns"
+    printf '%s\n' "linbox-$_name" > "$_rd/netns"
 
-    # 3) 启动：ip netns exec 设定网络，unshare 出挂载/主机名(/PID)。
+    # 启动：ip netns exec 设定网络，unshare 出挂载/主机名(/PID) 命名空间。
     _flags="-m -u"
     if [ "$(ns_supported -p)" = yes ]; then
         _flags="$_flags -p -f"
     else
-        warn "无 PID 命名空间，容器进程将不属于独立 PID 1"
+        warn "无 PID 命名空间，容器进程将没有独立 PID 1"
     fi
 
-    ip netns exec "linbox-$_name" unshare $_flags -- "$SELF" __enter "$_name" &
+    # 后台子 shell：跑容器，容器退出后自己记录退出码与事件（供 App 做退出/崩溃通知）。
+    # 用 stopping 标记区分「被 stop 主动停掉」与「自行退出/崩溃」。
+    rm -f "$_rd/stopping" "$_rd/exit"
+    : > "$_rd/console.log"
+    (
+        ip netns exec "linbox-$_name" unshare $_flags -- "$SELF" __enter "$_name" \
+            >> "$_rd/console.log" 2>&1
+        _rc=$?
+        if [ -f "$_rd/stopping" ]; then
+            event container "stop $_name rc=$_rc"
+        else
+            printf '%s\n' "$_rc" > "$_rd/exit"
+            if [ "$_rc" = 0 ]; then
+                event container "exit $_name rc=0"
+            else
+                event container "crash $_name rc=$_rc"
+            fi
+        fi
+    ) &
     _launched=$!
-    printf '%s\n' "$_launched" > "$(run_dir "$_name")/launch"
+    printf '%s\n' "$_launched" > "$_rd/launch"
 
-    # `unshare -p -f` 会再 fork 出容器内真正的 PID 1，因此要定位它的宿主 PID。
+    # `unshare -p -f` 会再 fork 出容器内真正的 PID 1，要定位它的宿主 PID。
     # 未启用 PID 命名空间时 unshare 直接 exec，没有子进程，此时沿用启动进程本身。
-    _cpid="$_launched"
-    _i=0
+    _cpid="$_launched"; _i=0
     while [ "$_i" -lt 25 ]; do
         _c="$(pgrep -P "$_launched" 2>/dev/null | head -n1)"
         [ -n "$_c" ] && { _cpid="$_c"; break; }
-        sleep 0.2
-        _i=$((_i + 1))
+        sleep 0.2; _i=$((_i + 1))
     done
-    printf '%s\n' "$_cpid" > "$(run_dir "$_name")/pid"
+    printf '%s\n' "$_cpid" > "$_rd/pid"
 
     # 把容器 PID 1 与启动进程放进容器 cgroup；其后代随 fork 继承。
     if [ -n "$_cg" ]; then
@@ -457,22 +861,30 @@ cmd_start() {
             printf '%s\n' "$_p" > "$_cg/cgroup.procs" 2>/dev/null || true
         done
     fi
+
+    # 网络切换后 netd 会重刷 iptables，start 时重放端口映射。
+    port_sync "$_name" >/dev/null 2>&1 || true
+
     sleep 1
-    if ! running_pid "$_name" >/dev/null 2>&1; then
+    running_pid "$_name" >/dev/null 2>&1 || \
         warn "容器启动后立即退出，请检查 rootfs 的 $INIT 是否存在且可执行"
-    fi
-    log "容器 $_name 已启动 (unshare pid=$_launched, container pid=$_cpid)"
+    event container "start $_name"
+    log "容器 $_name 已启动 (launch pid=$_launched, container pid=$_cpid)"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"pid\":$_cpid,\"ip\":\"$(json_escape "$IP")\",\"host\":\"$(json_escape "$HOSTNAME")\"}"
 }
 
 cmd_stop() {
     _name=${1:-}
     load_config "$_name"
-    _pid="$(running_pid "$_name" 2>/dev/null || echo '')"
-    _lp="$(cat "$(run_dir "$_name")/launch" 2>/dev/null || echo '')"
+    _rd="$(run_dir "$_name")"
+    _pid="$(running_pid "$_name" 2>/dev/null || true)"
+    _lp="$(cat "$_rd/launch" 2>/dev/null || true)"
     _idx="$(veth_index "$_name")"
 
-    # 先进入容器挂载命名空间卸载镜像：这样 loop 设备会立即释放，
-    # 而不是等命名空间销毁（后者可能有延迟，导致 loop 残留）。
+    # 先打标记，让后台子 shell 把这次退出记为 stop 而不是 crash。
+    if [ -d "$_rd" ]; then printf 'stopping\n' > "$_rd/stopping" 2>/dev/null || true; fi
+
+    # 先进入容器挂载命名空间卸载镜像：loop 立即释放，不等命名空间销毁（后者可能有延迟）。
     if [ -n "$_pid" ] && [ -d "/proc/$_pid/ns/mnt" ]; then
         nsenter -t "$_pid" -m -- umount "$(cont_dir "$_name")/$MNT_NAME" 2>/dev/null || true
     fi
@@ -481,106 +893,609 @@ cmd_stop() {
     teardown_net "$_name" "$_idx"
     teardown_cgroup "$_name"
     detach_loops "$_name"
-    rm -rf "$(run_dir "$_name")"
+    rm -rf "$_rd"
+    event container "stop $_name"
     log "容器 $_name 已停止"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"status\":\"stopped\"}"
 }
 
-cmd_restart() { cmd_stop "${1:-}"; cmd_start "${1:-}"; }
+cmd_restart() {
+    _name=${1:-}
+    cmd_stop "$_name" >/dev/null 2>&1 || true
+    cmd_start "$_name"
+}
 
 cmd_status() {
     _name=${1:-}
-    if [ -z "$_name" ]; then cmd_list; return; fi
+    if [ -z "$_name" ]; then cmd_list; return 0; fi
     load_config "$_name"
-    if _pid="$(running_pid "$_name" 2>/dev/null)"; then
-        printf '%s: running (pid=%s ip=%s host=%s)\n' "$_name" "$_pid" "$IP" "$HOSTNAME"
+    _st=stopped; _pid=""
+    if _pid="$(running_pid "$_name" 2>/dev/null)"; then _st=running; else _pid=""; fi
+    if [ "$J" = "1" ]; then
+        emit "{\"name\":\"$(json_escape "$_name")\",\"status\":\"$_st\",\"pid\":${_pid:-null},\"ip\":\"$(json_escape "$IP")\",\"host\":\"$(json_escape "$HOSTNAME")\"}"
     else
-        printf '%s: stopped (ip=%s host=%s)\n' "$_name" "$IP" "$HOSTNAME"
+        printf '%s: %s (ip=%s host=%s%s)\n' "$_name" "$_st" "$IP" "$HOSTNAME" \
+            "$([ -n "$_pid" ] && printf ' pid=%s' "$_pid")"
     fi
 }
 
 cmd_list() {
+    _arr=""
     for d in "$CONT_DIR"/*; do
         [ -d "$d" ] || continue
         _n="$(basename "$d")"
-        if running_pid "$_n" >/dev/null 2>&1; then _s=running; else _s=stopped; fi
-        printf '%-20s %-8s\n' "$_n" "$_s"
+        _ip="$(grep '^IP=' "$d/config" 2>/dev/null | head -n1 | cut -d= -f2)"
+        _hs="$(grep '^HOSTNAME=' "$d/config" 2>/dev/null | head -n1 | cut -d= -f2)"
+        _mem="$(grep '^MEMORY_MB=' "$d/config" 2>/dev/null | head -n1 | cut -d= -f2)"
+        _st=stopped; _pid=""
+        if _pid="$(running_pid "$_n" 2>/dev/null)"; then _st=running; else _pid=""; fi
+        if [ "$J" = "1" ]; then
+            [ -n "$_arr" ] && _arr="$_arr,"
+            _arr="$_arr{\"name\":\"$(json_escape "$_n")\",\"status\":\"$_st\",\"pid\":${_pid:-null},\"ip\":\"$(json_escape "$_ip")\",\"host\":\"$(json_escape "$_hs")\",\"memoryMB\":${_mem:-null}}"
+        else
+            printf '%-16s %-8s %-14s %s\n' "$_n" "$_st" "$_ip" "$_hs"
+        fi
     done
+    [ "$J" = "1" ] && emit "[$_arr]"
+    return 0
 }
 
-cmd_shell() {
+cmd_destroy() {
     _name=${1:-}
-    load_config "$_name"
-    _pid="$(running_pid "$_name" 2>/dev/null)" || die "容器未运行: $_name"
-    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || echo "linbox-$_name")"
+    valid_name "$_name" || fail BAD_NAME "非法容器名: $_name"
+    [ -d "$(cont_dir "$_name")" ] || fail NO_CONTAINER "容器不存在: $_name"
+    running_pid "$_name" >/dev/null 2>&1 && { cmd_stop "$_name" >/dev/null 2>&1 || true; }
+    detach_loops "$_name"
+    _pf="$(ports_file "$_name")"
+    if [ -f "$_pf" ]; then
+        while IFS= read -r _l; do
+            [ -n "$_l" ] || continue
+            # shellcheck disable=SC2086
+            port_unapply "$_name" $_l < /dev/null
+        done < "$_pf"
+    fi
+    rm -rf "$(cont_dir "$_name")" "$(run_dir "$_name")"
+    event container "destroy $_name"
+    log "已销毁容器 $_name"
+    emit "{\"name\":\"$(json_escape "$_name")\"}"
+}
+
+# ---------------------------------------------------------------- shell / exec / attach
+
+# 在容器里跑一条命令，使用发行版自己的 PATH/HOME/TERM 环境（宿主 Android 环境会让
+# ls/head 等去 /system/bin 找而报 command not found）。
+cont_do() {
+    _name=$1; _pid=$2; _cmd=$3
+    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
     _root="/proc/$_pid/root"
-    log "进入 $_name 的 shell（exit 退出）"
-    # 关键：用容器自己的 PATH/HOME/TERM，而不是宿主 Android 的环境，
-    # 否则 ls/head 等会去宿主 /system/bin 里找而报 command not found。
     if [ -x "$_root/usr/bin/env" ]; then
         ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
             chroot "$_root" /usr/bin/env -i \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             HOME=/root TERM="${TERM:-xterm}" LANG=C.UTF-8 \
-            /bin/sh -i && return
+            /bin/sh -c "$_cmd"
+    else
+        ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+            chroot "$_root" /bin/sh -c "$_cmd"
+    fi
+}
+
+cmd_exec() {
+    _name=${1:-}; shift || true
+    [ "${1:-}" = "--" ] && shift || true
+    [ $# -gt 0 ] || fail BAD_ARGS "用法: linbox exec <名> -- <命令>"
+    load_config "$_name"
+    _pid="$(running_pid "$_name" 2>/dev/null)" || fail NOT_RUNNING "容器未运行: $_name"
+    if [ "$J" = "1" ]; then
+        _out="$(cont_do "$_name" "$_pid" "$*" 2>/dev/null)"; _rc=$?
+        emit "{\"stdout\":\"$(json_escape "$_out")\",\"exitCode\":$_rc}"
+    else
+        cont_do "$_name" "$_pid" "$*"
+    fi
+}
+
+cmd_shell() {
+    _name=${1:-}
+    load_config "$_name"
+    _pid="$(running_pid "$_name" 2>/dev/null)" || fail NOT_RUNNING "容器未运行: $_name"
+    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
+    _root="/proc/$_pid/root"
+    log "进入 $_name 的 shell（exit 退出）"
+    if [ -x "$_root/usr/bin/env" ]; then
+        ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+            chroot "$_root" /usr/bin/env -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/root TERM="${TERM:-xterm}" LANG=C.UTF-8 \
+            /bin/sh -i && return 0
     fi
     ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
         chroot "$_root" /bin/sh -i 2>/dev/null || \
-        ip netns exec "$_ns" nsenter -t "$_pid" -m -- \
-            chroot "$_root" /bin/sh -i
+    ip netns exec "$_ns" nsenter -t "$_pid" -m -- \
+        chroot "$_root" /bin/sh -i
 }
 
-# ---------------------------------------------------------------- 快照
-
-cmd_snapshot() {
-    _name=${1:-}; _label=${2:-}
-    load_config "$_name"
-    running_pid "$_name" >/dev/null 2>&1 && die "请先停止容器再建快照（保证镜像一致）"
-    _sd="$(cont_dir "$_name")/snapshots"
-    mkdir -p "$_sd"
-    cp "$(cont_dir "$_name")/$IMAGE" "$_sd/$_label.img" || die "快照失败"
-    log "已创建快照: $_label（镜像副本）"
-}
-
-cmd_restore() {
-    _name=${1:-}; _label=${2:-}
-    load_config "$_name"
-    running_pid "$_name" >/dev/null 2>&1 && die "请先停止容器再恢复"
-    _sd="$(cont_dir "$_name")/snapshots"
-    [ -f "$_sd/$_label.img" ] || die "快照不存在: $_label"
-    cp "$_sd/$_label.img" "$(cont_dir "$_name")/$IMAGE" || die "恢复失败"
-    log "已从快照 $_label 恢复"
-}
-
-cmd_destroy() {
+# App 终端专用：busybox script 在容器外提供 PTY（Ubuntu base 里没有 busybox）。
+cmd_attach() {
     _name=${1:-}
-    running_pid "$_name" >/dev/null 2>&1 && cmd_stop "$_name"
-    detach_loops "$_name"
-    rm -rf "$(cont_dir "$_name")" "$(run_dir "$_name")"
-    log "已销毁容器 $_name"
+    load_config "$_name"
+    _pid="$(running_pid "$_name" 2>/dev/null)" || fail NOT_RUNNING "容器未运行: $_name"
+    command -v busybox >/dev/null 2>&1 || fail TOOL_MISSING "缺少 busybox，无法提供 PTY"
+    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
+    _root="/proc/$_pid/root"
+    if [ -x "$_root/usr/bin/env" ]; then
+        _sc="chroot $_root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=${TERM:-xterm} LANG=C.UTF-8 /bin/sh -i"
+    else
+        _sc="chroot $_root /bin/sh -i"
+    fi
+    log "接入 $_name 终端（Ctrl-D 退出）"
+    ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+        busybox script -q -c "$_sc" /dev/null
+}
+
+# ---------------------------------------------------------------- 运行时改配置
+
+cmd_set() {
+    _name=${1:-}; shift || true
+    [ -n "$_name" ] || fail BAD_ARGS "用法: linbox set <名> [--mem 兆] [--ip 地址] [--host 名] [--init 路径] [--autostart 0|1]"
+    load_config "$_name"
+    _cd="$(cont_dir "$_name")"
+    _changed=0
+    while [ $# -gt 0 ]; do
+        _k=$1; shift
+        case "$_k" in
+            --mem)
+                _v=${1:-}; [ $# -gt 0 ] && shift || true
+                [ -n "$_v" ] || fail BAD_ARGS "--mem 需要数值（MB）"
+                save_config_replacing "$_cd/config" MEMORY_MB "$_v"
+                _cg="/sys/fs/cgroup/linbox_$_name"
+                if running_pid "$_name" >/dev/null 2>&1 && [ -f "$_cg/memory.max" ]; then
+                    printf '%s\n' "$((_v * 1024 * 1024))" > "$_cg/memory.max" 2>/dev/null || true
+                    log "内存限额已在线调整为 ${_v}MB"
+                else
+                    log "内存限额将在下次启动生效: ${_v}MB"
+                fi
+                _changed=1 ;;
+            --ip)
+                _v=${1:-}; [ $# -gt 0 ] && shift || true
+                [ -n "$_v" ] || fail BAD_ARGS "--ip 需要地址"
+                running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再改 IP"
+                save_config_replacing "$_cd/config" IP "$_v"; _changed=1 ;;
+            --host)
+                _v=${1:-}; [ $# -gt 0 ] && shift || true
+                [ -n "$_v" ] || fail BAD_ARGS "--host 需要主机名"
+                running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再改主机名"
+                save_config_replacing "$_cd/config" HOSTNAME "$_v"; _changed=1 ;;
+            --init)
+                _v=${1:-}; [ $# -gt 0 ] && shift || true
+                [ -n "$_v" ] || fail BAD_ARGS "--init 需要路径"
+                running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再改 init"
+                save_config_replacing "$_cd/config" INIT "$_v"; _changed=1 ;;
+            --autostart)
+                _v=${1:-}; [ $# -gt 0 ] && shift || true
+                case "$_v" in
+                    1|on|yes)  autostart_add "$_name"; _changed=1 ;;
+                    0|off|no)  autostart_del "$_name"; _changed=1 ;;
+                    *) fail BAD_ARGS "--autostart 取 0 或 1" ;;
+                esac ;;
+            *) fail BAD_ARGS "未知参数: $_k" ;;
+        esac
+    done
+    [ "$_changed" = 1 ] || fail BAD_ARGS "用法: linbox set <名> [--mem 兆] [--ip 地址] [--host 名] [--init 路径] [--autostart 0|1]"
+    event container "set $_name"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"ok\":true}"
+}
+
+# ---------------------------------------------------------------- 控制台日志
+
+cmd_log() {
+    _name=${1:-}; shift || true
+    _lines=40; _follow=0
+    while [ $# -gt 0 ]; do
+        _k=$1; shift
+        case "$_k" in
+            -n) _lines=${1:-40}; [ $# -gt 0 ] && shift || true ;;
+            --follow|-f) _follow=1 ;;
+            *) fail BAD_ARGS "未知参数: $_k" ;;
+        esac
+    done
+    load_config "$_name"
+    _rd="$(run_dir "$_name")"
+    _f="$_rd/console.log"
+    [ -f "$_f" ] || fail NO_LOG "没有可用日志（容器未运行过，或已被 stop 清理）"
+    if [ "$J" = "1" ]; then
+        tail -n "$_lines" "$_f" > "$_rd/.logtail" 2>/dev/null || true
+        _arr=""
+        while IFS= read -r _l; do
+            [ -n "$_arr" ] && _arr="$_arr,"
+            _arr="$_arr\"$(json_escape "$_l")\""
+        done < "$_rd/.logtail"
+        rm -f "$_rd/.logtail"
+        emit "[$_arr]"
+    elif [ "$_follow" = 1 ]; then
+        tail -n "$_lines" -f "$_f"
+    else
+        tail -n "$_lines" "$_f"
+    fi
+}
+
+# ---------------------------------------------------------------- 镜像源一键替换
+
+mirror_host() {
+    case "$1" in
+        tuna)   printf 'mirrors.tuna.tsinghua.edu.cn\n' ;;
+        aliyun) printf 'mirrors.aliyun.com\n' ;;
+        ustc)   printf 'mirrors.ustc.edu.cn\n' ;;
+        *)      printf '\n' ;;
+    esac
+}
+
+# 把容器 rootfs 里的 apt 源指向某个镜像站；official 用 .linbox.bak 备份还原。
+# 必须同时处理 24.04+ 的 deb822（/etc/apt/sources.list.d/*.sources）与旧的 *.list。
+mirror_rewrite() {
+    _root=$1; _preset=$2
+    _files=""
+    [ -f "$_root/etc/apt/sources.list" ] && _files="$_files $_root/etc/apt/sources.list"
+    for f in "$_root"/etc/apt/sources.list.d/*.sources "$_root"/etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] && _files="$_files $f"
+    done
+
+    if [ "$_preset" = official ]; then
+        _n=0
+        for f in $_files; do
+            if [ -f "$f.linbox.bak" ]; then
+                cp "$f.linbox.bak" "$f" 2>/dev/null && _n=$((_n + 1))
+            fi
+        done
+        printf '%s\n' "$_n"
+        return 0
+    fi
+
+    _host="$(mirror_host "$_preset")"
+    _n=0
+    for f in $_files; do
+        [ -f "$f.linbox.bak" ] || cp "$f" "$f.linbox.bak" 2>/dev/null || true
+        sed -e "s|https\?://archive\.ubuntu\.com/ubuntu|http://$_host/ubuntu|g" \
+            -e "s|https\?://security\.ubuntu\.com/ubuntu|http://$_host/ubuntu|g" \
+            -e "s|https\?://ports\.ubuntu\.com/ubuntu-ports|http://$_host/ubuntu-ports|g" \
+            -e "s|https\?://deb\.debian\.org/debian|http://$_host/debian|g" \
+            -e "s|https\?://security\.debian\.org/debian-security|http://$_host/debian-security|g" \
+            "$f.linbox.bak" > "$f" 2>/dev/null || true
+        _n=$((_n + 1))
+    done
+    printf '%s\n' "$_n"
+}
+
+cmd_mirror() {
+    _name=${1:-}; shift || true
+    _preset=${1:-}
+    case "$_preset" in --restore|-r) _preset=official ;; esac
+    case "$_preset" in
+        tuna|aliyun|ustc|official) ;;
+        *) fail BAD_ARGS "用法: linbox mirror <名> <tuna|aliyun|ustc|official|--restore>" ;;
+    esac
+    load_config "$_name"
+
+    container_root "$_name"
+    if [ "$_CONT_MOUNTED" = 1 ]; then _mnt_ok=1; else _mnt_ok=0; fi
+    _n="$(mirror_rewrite "$_root" "$_preset")"
+    _distro="$(head -n1 "$_root/etc/os-release" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
+    [ "$_mnt_ok" = 1 ] && image_umount_host "$_name"
+    event container "mirror $_name $_preset"
+    log "已改写 $_n 个 apt 源文件为 $_preset"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"mirror\":\"$(json_escape "$_preset")\",\"files\":$_n,\"distro\":\"$(json_escape "$_distro")\"}"
+}
+
+# ---------------------------------------------------------------- 文件导入导出
+
+# 取得容器根文件系统的宿主可见路径（回填全局 _root / _CONT_MOUNTED）。
+# 运行中经 /proc/<pid>/root 访问；停止态临时 loop 挂载 containers/<名>/mnt（用完必须 umount）。
+container_root() {
+    _name=$1
+    _CONT_MOUNTED=0
+    if running_pid "$_name" >/dev/null 2>&1; then
+        _root="/proc/$(running_pid "$_name")/root"
+    else
+        image_mount_host "$_name"
+        _CONT_MOUNTED=1
+        _root="$(cont_dir "$_name")/$MNT_NAME"
+    fi
+}
+
+cmd_push() {
+    _name=""; _a=""; _b=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir) shift ;;
+            *) if [ -z "$_name" ]; then _name=$1; elif [ -z "$_a" ]; then _a=$1; elif [ -z "$_b" ]; then _b=$1; fi; shift ;;
+        esac
+    done
+    [ -n "$_name" ] && [ -n "$_a" ] && [ -n "$_b" ] || \
+        fail BAD_ARGS "用法: linbox push <名> <宿主路径> <容器路径>"
+    load_config "$_name"
+    [ -e "$_a" ] || fail BAD_ARGS "宿主路径不存在: $_a"
+    container_root "$_name"
+    _temp_mnt="$_CONT_MOUNTED"
+    mkdir -p "$(dirname "$_root$_b")" 2>/dev/null || true
+    cp -a "$_a" "$_root$_b"; _rc=$?
+    [ "$_temp_mnt" = 1 ] && image_umount_host "$_name"
+    [ "$_rc" = 0 ] || fail COPY_FAILED "拷贝失败: $_a -> $_b"
+    log "已推入: $_a -> $_name:$_b"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"path\":\"$(json_escape "$_b")\"}"
+}
+
+cmd_pull() {
+    _name=""; _a=""; _b=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir) shift ;;
+            *) if [ -z "$_name" ]; then _name=$1; elif [ -z "$_a" ]; then _a=$1; elif [ -z "$_b" ]; then _b=$1; fi; shift ;;
+        esac
+    done
+    [ -n "$_name" ] && [ -n "$_a" ] && [ -n "$_b" ] || \
+        fail BAD_ARGS "用法: linbox pull <名> <容器路径> <宿主路径>"
+    load_config "$_name"
+    container_root "$_name"
+    _temp_mnt="$_CONT_MOUNTED"
+    [ -e "$_root$_a" ] || { [ "$_temp_mnt" = 1 ] && image_umount_host "$_name"; fail BAD_ARGS "容器路径不存在: $_a"; }
+    mkdir -p "$(dirname "$_b")" 2>/dev/null || true
+    cp -a "$_root$_a" "$_b"; _rc=$?
+    [ "$_temp_mnt" = 1 ] && image_umount_host "$_name"
+    [ "$_rc" = 0 ] || fail COPY_FAILED "拷贝失败: $_a -> $_b"
+    log "已拉出: $_name:$_a -> $_b"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"path\":\"$(json_escape "$_b")\"}"
+}
+
+# ---------------------------------------------------------------- 开机自启
+
+autostart_add() {
+    _name=${1:-}
+    [ -n "$_name" ] || fail BAD_ARGS "用法: linbox autostart add <名>"
+    [ -d "$(cont_dir "$_name")" ] || fail NO_CONTAINER "容器不存在: $_name"
+    mkdir -p "$LINBOX_DIR" 2>/dev/null || true
+    grep -qx "$_name" "$AUTOSTART_FILE" 2>/dev/null || printf '%s\n' "$_name" >> "$AUTOSTART_FILE"
+    log "已加入开机自启: $_name"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"autostart\":true}"
+}
+
+autostart_del() {
+    _name=${1:-}
+    [ -n "$_name" ] || fail BAD_ARGS "用法: linbox autostart del <名>"
+    if [ -f "$AUTOSTART_FILE" ]; then
+        _tmp="$AUTOSTART_FILE.tmp"; : > "$_tmp"
+        while IFS= read -r _l; do
+            [ "$_l" = "$_name" ] || printf '%s\n' "$_l" >> "$_tmp"
+        done < "$AUTOSTART_FILE"
+        mv "$_tmp" "$AUTOSTART_FILE"
+    fi
+    log "已移出自启: $_name"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"autostart\":false}"
+}
+
+autostart_list() {
+    _arr=""
+    if [ -f "$AUTOSTART_FILE" ]; then
+        while IFS= read -r _l; do
+            [ -n "$_l" ] || continue
+            if [ "$J" = "1" ]; then
+                [ -n "$_arr" ] && _arr="$_arr,"
+                _arr="$_arr\"$(json_escape "$_l")\""
+            else
+                printf '%s\n' "$_l"
+            fi
+        done < "$AUTOSTART_FILE"
+    fi
+    [ "$J" = "1" ] && emit "[$_arr]"
+    return 0
+}
+
+cmd_autostart() {
+    _sub=${1:-list}
+    shift || true
+    case "$_sub" in
+        add)        autostart_add "${1:-}" ;;
+        del|rm)     autostart_del "${1:-}" ;;
+        list)       autostart_list ;;
+        clear)      rm -f "$AUTOSTART_FILE"; log "已清空自启列表"; emit "null" ;;
+        *) fail BAD_ARGS "用法: linbox autostart add|del|list|clear" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 自检 / 版本
+
+tool_path() {
+    _n=$1
+    if command -v "$_n" >/dev/null 2>&1; then command -v "$_n"; return 0; fi
+    for _d in "$LINBOX_DIR/bin" "$MODULE_DIR/bin"; do
+        if [ -x "$_d/$_n" ]; then printf '%s\n' "$_d/$_n"; return 0; fi
+    done
+    printf '\n'
+}
+
+module_version() {
+    _f="$MODULE_DIR/module.prop"
+    [ -f "$_f" ] || return 0
+    sed -n 's/^version=//p' "$_f" 2>/dev/null | head -n1
+}
+
+# 收集能力信息到全局变量，供 caps / doctor 复用
+caps_collect() {
+    _rpid="$(ns_supported -p)"; _rmnt="$(ns_supported -m)"
+    _rnet="$(ns_supported -n)"; _ruts="$(ns_supported -u)"
+    if [ -e /sys/fs/cgroup/cgroup.controllers ]; then _rcg=yes; else _rcg=no; fi
+    _cgc="$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)"
+    _ext4="$(grep -qw ext4 /proc/filesystems 2>/dev/null && printf yes || printf no)"
+    _mke="$(command -v mke2fs >/dev/null 2>&1 && command -v losetup >/dev/null 2>&1 && printf yes || printf no)"
+    _ipv="$(ip -V 2>/dev/null | head -n1 || printf no)"
+    _tp_resize="$(tool_path resize2fs)"
+    _tp_e2fsck="$(tool_path e2fsck)"
+    _tp_busybox="$(tool_path busybox)"
+    _tp_iptables="$(command -v iptables 2>/dev/null || true)"
+    _tp_unxz=no
+    if [ -n "$_tp_busybox" ] && "$_tp_busybox" --list 2>/dev/null | grep -qx unxz; then
+        _tp_unxz=yes
+    fi
+}
+
+caps_json() {
+    printf '{"kernel":"%s","arch":"%s","ns":{"pid":"%s","mnt":"%s","net":"%s","uts":"%s"},"cgroupV2":"%s","cgroupControllers":"%s","ext4":"%s","mke2fsLosetup":"%s","iproute2":"%s","tools":{"resize2fs":"%s","e2fsck":"%s","busybox":"%s","unxz":"%s","iptables":"%s"}}' \
+        "$(json_escape "$(uname -r)")" "$(json_escape "$(uname -m)")" \
+        "$_rpid" "$_rmnt" "$_rnet" "$_ruts" \
+        "$_rcg" "$(json_escape "$_cgc")" "$_ext4" "$_mke" "$(json_escape "$_ipv")" \
+        "$(json_escape "$_tp_resize")" "$(json_escape "$_tp_e2fsck")" \
+        "$(json_escape "$_tp_busybox")" "$_tp_unxz" "$(json_escape "$_tp_iptables")"
+}
+
+cmd_caps() {
+    caps_collect
+    if [ "$J" = "1" ]; then emit "$(caps_json)"; return 0; fi
+    printf '%-20s %s\n' '内核版本' "$(uname -r)"
+    printf '%-20s %s\n' 'arch' "$(uname -m)"
+    printf '%-20s %s\n' 'PID 命名空间' "$_rpid"
+    printf '%-20s %s\n' '挂载命名空间' "$_rmnt"
+    printf '%-20s %s\n' '网络命名空间' "$_rnet"
+    printf '%-20s %s\n' 'UTS 命名空间' "$_ruts"
+    printf '%-20s %s (%s)\n' 'cgroup v2' "$_rcg" "$_cgc"
+    printf '%-20s %s\n' 'ext4 文件系统' "$_ext4"
+    printf '%-20s %s\n' 'mke2fs/losetup' "$_mke"
+    printf '%-20s %s\n' 'iproute2' "$_ipv"
+    printf '%-20s %s\n' 'resize2fs' "${_tp_resize:-缺失}"
+    printf '%-20s %s\n' 'e2fsck' "${_tp_e2fsck:-缺失}"
+    printf '%-20s %s\n' 'busybox' "${_tp_busybox:-缺失}"
+    printf '%-20s %s\n' 'busybox unxz' "$_tp_unxz"
+    printf '%-20s %s\n' 'iptables' "${_tp_iptables:-缺失}"
+    if ! ip link show >/dev/null 2>&1; then warn "iproute2 不可用，容器网络将无法建立"; fi
+    if [ "$_rpid" = no ]; then
+        warn "内核未启用 PID 命名空间：容器暂无独立 PID 1，需打内核补丁（见 kernel/）"
+    fi
+    return 0
+}
+
+cmd_version() {
+    _mv="$(module_version)"
+    _mvj=null; [ -n "$_mv" ] && _mvj="\"$(json_escape "$_mv")\""
+    if [ "$J" = "1" ]; then
+        emit "{\"cli\":\"$LINBOX_VERSION\",\"protocol\":$LINBOX_PROTOCOL,\"module\":$_mvj}"
+    else
+        printf 'linbox %s (protocol %s) 模块: %s\n' \
+            "$LINBOX_VERSION" "$LINBOX_PROTOCOL" "${_mv:-未安装}"
+    fi
+}
+
+# 一次给全：root + 模块状态 + 全部能力（App 首次引导用这一个命令就够）
+cmd_doctor() {
+    _root=no; [ "$(id -u)" = 0 ] && _root=yes
+    if [ -d "$MODULE_DIR" ]; then
+        _mv="$(module_version)"
+        if [ -f "$MODULE_DIR/disable" ]; then _mod=disabled; else _mod=enabled; fi
+    else
+        _mv=""; _mod=missing
+    fi
+    _mvj=null; [ -n "$_mv" ] && _mvj="\"$(json_escape "$_mv")\""
+    caps_collect
+
+    if [ "$J" = "1" ]; then
+        emit "{\"root\":\"$_root\",\"cli\":\"$LINBOX_VERSION\",\"protocol\":$LINBOX_PROTOCOL,\"module\":{\"status\":\"$_mod\",\"version\":$_mvj,\"path\":\"$MODULE_DIR\"},\"caps\":$(caps_json)}"
+        return 0
+    fi
+    printf 'root: %s\n' "$_root"
+    printf 'CLI: %s (protocol %s)\n' "$LINBOX_VERSION" "$LINBOX_PROTOCOL"
+    printf '模块: %s%s\n' "$_mod" "$([ -n "$_mv" ] && printf ' (%s)' "$_mv")"
+    printf 'PID 命名空间: %s\n' "$_rpid"
+    printf '网桥 %s: %s\n' "$BRIDGE" "$(ip link show "$BRIDGE" >/dev/null 2>&1 && printf 存在 || printf 未建立)"
+    if [ "$_root" = no ]; then warn "未以 root 运行：请用 su -c 'linbox ...'"; fi
+    if [ "$_rpid" = no ]; then warn "内核无 PID 命名空间：需刷入补丁内核（App 只给指引，不写分区）"; fi
+    return 0
+}
+
+usage() {
+    cat <<'USAGE'
+k60-linbox - 最接近虚拟机的 Android 系统容器运行时
+用法: su -c 'linbox <命令> [参数]'        （任意命令加 --json 输出单行 JSON）
+
+引导   doctor | version | caps
+发行版 base add|import|list|remove
+容器   create <名> --base <名> [--size 4G] [--mem 2048] [--host 名] [--ip 地址] [--init 路径]
+       list | start <名> | stop <名> | restart <名> | status [名] | destroy <名>
+       exec <名> -- <命令> | shell <名> | attach <名> | log <名> [-n 行] [-f] [--json]
+       set <名> [--mem 兆] [--ip 地址] [--host 名] [--init 路径] [--autostart 0|1]
+       resize <名> --size 8G
+       snapshot <名> <标签> | restore <名> <标签> | snapshot-list <名> | snapshot-rm <名> <标签>
+网络   port add|del|list|sync <名> [协议 宿主端口 容器端口]
+       mirror <名> <tuna|aliyun|ustc|official>
+文件   push <名> <宿主路径> <容器路径> | pull <名> <容器路径> <宿主路径>
+其他   autostart add|del|list|clear
+USAGE
 }
 
 # ---------------------------------------------------------------- 入口
 
-usage() { sed -n '18,32p' "$0"; }
+# 解析自身绝对路径，供容器内部递归调用（__enter）。
+case "$0" in
+    /*) SELF="$0" ;;
+    *)  SELF="$(command -v "$0" 2>/dev/null || printf '%s/%s' "$(pwd)" "$0")" ;;
+esac
+
+[ "$(id -u)" = 0 ] || fail NOT_ROOT "需要 root：请用 su -c 'linbox ...' 运行"
+
+# 统一摘掉 --json（可出现在任意位置），其余参数原样保留。
+# 用换行作 IFS 重建参数表，这样含空格的参数（如 exec 的命令）不会被拆散。
+_json=0
+for _a in "$@"; do [ "$_a" = "--json" ] && _json=1; done
+if [ "$_json" = 1 ]; then
+    J=1
+    _kept=""; _first=1
+    for _a in "$@"; do
+        [ "$_a" = "--json" ] && continue
+        if [ "$_first" = 1 ]; then _kept="$_a"; _first=0; else _kept="$_kept
+$_a"; fi
+    done
+    _oldifs=$IFS
+    IFS='
+'
+    set -f                       # 关闭通配符展开，避免 exec 的命令里出现 * / ? 被 glob
+    # shellcheck disable=SC2086
+    set -- $_kept
+    set +f
+    IFS=$_oldifs
+fi
 
 ensure_dirs
 
 _cmd=${1:-}
 [ $# -gt 0 ] && shift
+
 case "$_cmd" in
+    version)                    cmd_version ;;
+    doctor)                     cmd_doctor ;;
     caps)                       cmd_caps ;;
     base)                       cmd_base "$@" ;;
     create)                     cmd_create "$@" ;;
     list)                       cmd_list ;;
-    start)                      cmd_start "${1:?容器名}" ;;
-    stop)                       cmd_stop "${1:?容器名}" ;;
-    restart)                    cmd_restart "${1:?容器名}" ;;
+    start)                      cmd_start "${1:-}" ;;
+    stop)                       cmd_stop "${1:-}" ;;
+    restart)                    cmd_restart "${1:-}" ;;
     status)                     cmd_status "${1:-}" ;;
-    shell)                      cmd_shell "${1:?容器名}" ;;
-    snapshot)                   cmd_snapshot "${1:?容器名}" "${2:?快照标签}" ;;
-    restore)                    cmd_restore "${1:?容器名}" "${2:?快照标签}" ;;
-    destroy)                    cmd_destroy "${1:?容器名}" ;;
-    __enter)                    cmd_enter "${1:?容器名}" ;;
+    destroy)                    cmd_destroy "${1:-}" ;;
+    exec)                       cmd_exec "$@" ;;
+    shell)                      cmd_shell "${1:-}" ;;
+    attach)                     cmd_attach "${1:-}" ;;
+    set)                        cmd_set "$@" ;;
+    resize)                     cmd_resize "$@" ;;
+    snapshot|restore|snapshot-rm)
+        [ -n "${1:-}" ] && [ -n "${2:-}" ] || fail BAD_ARGS "用法: linbox $_cmd <名> <标签>"
+        case "$_cmd" in
+            snapshot)    cmd_snapshot "$1" "$2" ;;
+            restore)     cmd_restore "$1" "$2" ;;
+            snapshot-rm) cmd_snapshot_rm "$1" "$2" ;;
+        esac ;;
+    snapshot-list|snapshots)    cmd_snapshot_list "${1:-}" ;;
+    port)                       cmd_port "$@" ;;
+    mirror)                     cmd_mirror "$@" ;;
+    push)                       cmd_push "$@" ;;
+    pull)                       cmd_pull "$@" ;;
+    log|logs)                   cmd_log "$@" ;;
+    autostart)                  cmd_autostart "$@" ;;
+    __enter)                    cmd_enter "${1:-}" ;;
     ''|-h|--help|help)          usage ;;
-    *) die "未知命令: $_cmd（用 linbox --help）" ;;
+    *) fail UNKNOWN_CMD "未知命令: $_cmd（用 linbox --help）" ;;
 esac
