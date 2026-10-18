@@ -59,18 +59,36 @@ jobs:
           set -euxo pipefail
           gradle -p app assembleDebug --no-daemon --stacktrace
 
-      - name: Verify APK
+      - name: Verify APK and generate release.json
         run: |
           set -euxo pipefail
           ls -l app/app/build/outputs/apk/debug/
           test -s app/app/build/outputs/apk/debug/app-debug.apk
-          sha256sum app/app/build/outputs/apk/debug/app-debug.apk
+          mkdir -p out
+          cp app/app/build/outputs/apk/debug/app-debug.apk out/app-debug.apk
+
+          # 版本号取自 Gradle 脚本，minProtocol 取自 App 里声明的协议常量。
+          VERSION_NAME="$(sed -n 's/^\s*versionName = "\([^"]*\)"$/\1/p' app/app/build.gradle.kts | head -n1)"
+          VERSION_CODE="$(sed -n 's/^\s*versionCode = \([0-9]*\)$/\1/p' app/app/build.gradle.kts | head -n1)"
+          MIN_PROTOCOL="$(sed -n 's/.*const val PROTOCOL = \([0-9]*\).*/\1/p' \
+            app/app/src/main/java/com/k60linbox/manager/runtime/LinboxJson.kt | head -n1)"
+          test -n "$VERSION_NAME"
+          test -n "$VERSION_CODE"
+          test -n "$MIN_PROTOCOL"
+          printf '{"app":{"versionName":"%s","versionCode":%s,"minProtocol":%s},"tag":"%s"}\n' \
+            "$VERSION_NAME" "$VERSION_CODE" "$MIN_PROTOCOL" "$GITHUB_REF_NAME" > out/release.json
+          ( cd out && sha256sum app-debug.apk release.json > SHA256SUMS )
+          cat out/release.json
+          cat out/SHA256SUMS
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: k60-linbox-manager-apk-${{ github.sha }}
-          path: app/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            out/app-debug.apk
+            out/release.json
+            out/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
 
@@ -81,7 +99,9 @@ jobs:
         run: |
           set -euxo pipefail
           gh release create "$GITHUB_REF_NAME" \
-            app/app/build/outputs/apk/debug/app-debug.apk \
+            out/app-debug.apk \
+            out/release.json \
+            out/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "k60-linbox manager $GITHUB_REF_NAME" \
             --generate-notes

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 package com.k60linbox.manager.ui
 
+import android.Manifest
 import android.app.Application
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -50,6 +53,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.k60linbox.manager.data.copyUriTo
@@ -448,6 +452,24 @@ private fun ImportNameDialog(suggestion: String, onDismiss: () -> Unit, onConfir
 @Composable
 private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
     val prefs = state.prefs
+    val context = LocalContext.current
+
+    // Android 13+ 需要运行时授权才能显示通知；没授权也照开监控，只是看不到通知。
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { vm.setMonitorEnabled(true) }
+
+    fun toggleMonitor(wanted: Boolean) {
+        val needsGrant = wanted &&
+            Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        if (needsGrant) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            vm.setMonitorEnabled(wanted)
+        }
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
         Text("下载发行版用的镜像站", style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(4.dp))
@@ -478,7 +500,7 @@ private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
             }
             Switch(
                 checked = prefs?.monitorEnabled == true,
-                onCheckedChange = { vm.setMonitorEnabled(it) },
+                onCheckedChange = { toggleMonitor(it) },
             )
         }
 

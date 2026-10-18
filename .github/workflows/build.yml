@@ -45,11 +45,31 @@ jobs:
           unzip -p out/k60-linbox-magisk.zip module.prop | grep -q '^id=k60_linbox$'
           sha256sum out/k60-linbox-magisk.zip
 
+      - name: Generate release.json and SHA256SUMS
+        run: |
+          set -euxo pipefail
+          # 版本与协议以运行时脚本和 module.prop 为准，App 读它做版本/协议判断，
+          # 不去解析 release 正文。
+          MODULE_VERSION="$(sed -n 's/^version=//p' magisk/module.prop | head -n1)"
+          CLI_VERSION="$(sed -n 's/^LINBOX_VERSION="\([^"]*\)"/\1/p' runtime/bin/linbox | head -n1)"
+          PROTOCOL="$(sed -n 's/^LINBOX_PROTOCOL="\([0-9]*\)"/\1/p' runtime/bin/linbox | head -n1)"
+          test -n "$MODULE_VERSION"
+          test -n "$CLI_VERSION"
+          test -n "$PROTOCOL"
+          printf '{"moduleVersion":"%s","cliVersion":"%s","protocol":%s,"tag":"%s"}\n' \
+            "$MODULE_VERSION" "$CLI_VERSION" "$PROTOCOL" "$GITHUB_REF_NAME" > out/release.json
+          ( cd out && sha256sum k60-linbox-magisk.zip release.json > SHA256SUMS )
+          cat out/release.json
+          cat out/SHA256SUMS
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: k60-linbox-magisk-${{ github.sha }}
-          path: out/k60-linbox-magisk.zip
+          path: |
+            out/k60-linbox-magisk.zip
+            out/release.json
+            out/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
 
@@ -61,6 +81,8 @@ jobs:
           set -euxo pipefail
           gh release create "$GITHUB_REF_NAME" \
             out/k60-linbox-magisk.zip \
+            out/release.json \
+            out/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "k60-linbox $GITHUB_REF_NAME" \
             --generate-notes

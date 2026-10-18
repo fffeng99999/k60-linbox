@@ -12,6 +12,7 @@ import com.k60linbox.manager.data.describe
 import com.k60linbox.manager.net.DistroCatalog
 import com.k60linbox.manager.runtime.BaseInfo
 import com.k60linbox.manager.runtime.ContainerInfo
+import com.k60linbox.manager.service.ContainerMonitorService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -130,7 +131,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setDownloadMirror(id: String) = act("下载镜像站") { settings.setDownloadMirror(id); Result.success(Unit) }
     fun setAptMirror(id: String) = act("容器内换源") { settings.setAptMirror(id); Result.success(Unit) }
-    fun setMonitorEnabled(on: Boolean) = act("退出通知") { settings.setMonitorEnabled(on); Result.success(Unit) }
+    /** 开关退出/崩溃通知，同时把监控前台服务拉起来或停掉。 */
+    fun setMonitorEnabled(on: Boolean) = act(if (on) "开启退出通知" else "关闭退出通知") {
+        settings.setMonitorEnabled(on)
+        val context = getApplication<Application>()
+        if (on) ContainerMonitorService.start(context) else ContainerMonitorService.stop(context)
+        Result.success(Unit)
+    }
     fun setDefaultMem(mb: Int) = act("默认内存") { settings.setDefaultMemMb(mb); Result.success(Unit) }
     fun setDefaultSize(size: String) = act("默认大小") { settings.setDefaultSize(size); Result.success(Unit) }
     fun setDefaultInit(path: String) = act("默认 init") { settings.setDefaultInit(path); Result.success(Unit) }
