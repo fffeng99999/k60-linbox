@@ -222,3 +222,35 @@ ip route add default via <真实网关> dev <真实网卡>
 apt 仍报「gpgv required for verification, but neither seems installed」；
 装包可用 `apt-get install -y --allow-unauthenticated <包>`。这是 base 镜像的
 细节问题，不影响「容器有网 + 能装包」这一结论。
+
+## 13. 设备自带工具的坑（2026-10-19 实测，改运行时前必看）
+
+### 13.1 `sed` 是 toybox，不支持 GNU 的 `\?`
+
+```text
+$ sed --version
+toybox 0.8.12-android (is not GNU sed 9.0)
+
+# 同一份内容（URIs: http://ports.ubuntu.com/ubuntu-ports/）：
+sed 's|https\?://ports\.ubuntu\.com/ubuntu-ports|http://X/ubuntu-ports|g'  → 不匹配（原地未变）
+sed 's|https*://ports\.ubuntu\.com/ubuntu-ports|http://X/ubuntu-ports|g'  → 匹配成功
+sed 's|http://ports\.ubuntu\.com/ubuntu-ports|http://X/ubuntu-ports|g'    → 匹配成功
+```
+
+即：**`\?`（可选量词）在设备上完全无效且不报错**，会静默地什么都不替换——
+`linbox mirror` 一开始就是用 `https\?://...` 写的，实测「改了 2 个文件」但
+`sources.list.d/ubuntu.sources` 里的 `ports.ubuntu.com` 一个都没变。
+改用 `https*://`（BRE 里 `s*` 表示零个或多个 `s`）后可同时匹配 `http://` 与 `https://`。
+`\.`、`.*`、`[!.]` 这类基本用法正常。
+
+### 13.2 `busybox script` 不会因 stdin EOF 而结束
+
+`linbox attach` 里 `script -q -c "<cmd>" /dev/null`，当它的 stdin（管道）关闭时
+`script` 并不退出，容器内的交互式 shell 会一直挂着。因此 App 侧关闭终端时必须
+**先往 PTY 写一个 Ctrl-D（0x04）** 让里面的 shell 自己退出，再 `destroy()` 兜底
+（只 `destroy()` 作用到的是 `su`，里面的 `script`/`sh` 会被留下并占着 PTY）。
+
+### 13.3 经 `/proc/<pid>/root` 可以直接读写运行中容器的根文件系统
+
+实测 `echo x > /proc/<pid>/root/root/txt` 与 `cp`、`tar` 均正常，因此
+`push` / `pull` / `mirror` / `ls` 在容器运行中一律走这条路，只有停止态才临时挂镜像。
