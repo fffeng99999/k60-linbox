@@ -74,7 +74,7 @@ object DistroCatalog {
             val pattern = Regex("ubuntu-base-([0-9]+(?:\\.[0-9]+)+)-base-arm64\\.tar\\.gz")
             val best = pattern.findAll(html)
                 .map { it.groupValues[1] to it.value }
-                .maxWithOrNull(compareBy { versionKey(it.first) })
+                .maxWithOrNull { a, b -> compareVersions(a.first, b.first) }
                 ?: throw IOException("没有在 $dir 找到 arm64 base 归档")
             Resolved(dir + best.second, best.second, dir + "SHA256SUMS", "SHA-256")
         } else {
@@ -89,6 +89,17 @@ object DistroCatalog {
 
     private fun versionKey(version: String): List<Int> =
         version.split('.').map { it.toIntOrNull() ?: 0 }
+
+    /** 逐段比较版本号（List 本身不是 Comparable，故自己实现）。 */
+    private fun compareVersions(a: String, b: String): Int {
+        val x = versionKey(a)
+        val y = versionKey(b)
+        for (i in 0 until maxOf(x.size, y.size)) {
+            val diff = x.getOrElse(i) { 0 }.compareTo(y.getOrElse(i) { 0 })
+            if (diff != 0) return diff
+        }
+        return 0
+    }
 
     private suspend fun fetchText(url: String): String = withContext(Dispatchers.IO) {
         val request = Request.Builder().url(url).build()
