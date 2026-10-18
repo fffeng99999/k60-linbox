@@ -98,9 +98,33 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                         else -> "已启用（版本 ${info.module.version ?: "未知"}）"
                     },
                     action = {
-                        TextButton(onClick = { help = HelpKind.MODULE }) { Text("安装说明") }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (!info.module.enabled) {
+                                TextButton(
+                                    enabled = !state.installing && info.hasRoot,
+                                    onClick = { vm.installModule() },
+                                ) { Text(if (state.installing) "安装中…" else "自动安装") }
+                            }
+                            TextButton(onClick = { help = HelpKind.MODULE }) { Text("安装说明") }
+                        }
                     },
                 )
+                if (state.installing) {
+                    LinearProgressIndicator(
+                        progress = { if (state.progress < 0) 0f else state.progress / 100f },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        if (state.progress < 0) "正在下载模块…" else "正在下载模块 ${state.progress}%",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                val note = state.installNote
+                if (note != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(note, style = MaterialTheme.typography.bodySmall)
+                }
                 val pidOk = info.hasPidNs
                 val pidTitle = "独立 PID 命名空间（补丁内核）"
                 val pidDetail = if (pidOk) {

@@ -25,6 +25,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -52,6 +53,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.k60linbox.manager.net.DistroCatalog
 import com.k60linbox.manager.net.MirrorPresets
 import com.k60linbox.manager.runtime.BaseInfo
 import com.k60linbox.manager.runtime.ContainerInfo
@@ -116,6 +118,7 @@ fun MainScreen(onOpen: (String) -> Unit) {
                 0 -> ContainersTab(state, onOpen)
                 1 -> DistrosTab(
                     state = state,
+                    onDownload = { distro -> vm.downloadDistro(distro) },
                     onImport = {
                         picker.launch(
                             arrayOf(
@@ -307,35 +310,59 @@ private fun CreateDialog(
 @Composable
 private fun DistrosTab(
     state: MainViewModel.State,
+    onDownload: (DistroCatalog.Distro) -> Unit,
     onImport: () -> Unit,
     onRemove: (String, Boolean) -> Unit,
 ) {
     var removeTarget by remember { mutableStateOf<BaseInfo?>(null) }
 
-    Column(Modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Column(Modifier.padding(16.dp)) {
-            Text("已导入的发行版", style = MaterialTheme.typography.titleSmall)
+            Text("在线安装发行版", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(6.dp))
             Text(
-                "支持官方 base 归档：Ubuntu 用 ubuntu-base-*.tar.gz，Debian 用 debian-*-genericcloud-arm64.tar.xz。",
+                "下载官方归档后自动导入为可直接建容器的发行版。Ubuntu 走 base tarball，" +
+                    "Debian 走 cloud 镜像（国内暂无镜像，走官方源）。",
                 style = MaterialTheme.typography.bodySmall,
             )
-            Spacer(Modifier.height(10.dp))
-            Button(onClick = onImport) { Text("从文件导入") }
         }
+
+        val busy = state.distroBusy
+        if (busy != null) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                LinearProgressIndicator(
+                    progress = { if (state.distroProgress < 0) 0f else state.distroProgress / 100f },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(state.distroStage.ifEmpty { "处理中…" }, style = MaterialTheme.typography.bodySmall)
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        CatalogGroup("Ubuntu", DistroCatalog.ubuntu, busy, onDownload)
+        CatalogGroup("Debian", DistroCatalog.debian, busy, onDownload)
+
+        Spacer(Modifier.height(12.dp))
         HorizontalDivider()
+        Column(Modifier.padding(16.dp)) {
+            Text("已导入的发行版", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = onImport) { Text("从本地文件导入") }
+        }
         if (state.bases.isEmpty()) {
             Text("（尚未导入任何发行版）", Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
-            return
-        }
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(state.bases, key = { it.name }) { base ->
+        } else {
+            state.bases.forEach { base ->
                 Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
                     Column(Modifier.padding(12.dp)) {
                         Text(base.name, style = MaterialTheme.typography.titleMedium)
                         Text(base.path, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
                         if (base.containerList.isNotEmpty()) {
-                            Text("被容器引用：${base.containerList.joinToString(", ")}", style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                "被容器引用：${base.containerList.joinToString(", ")}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                         Spacer(Modifier.height(8.dp))
                         OutlinedButton(onClick = { removeTarget = base }) { Text("删除") }
@@ -359,6 +386,31 @@ private fun DistrosTab(
             },
             onDismiss = { removeTarget = null },
         )
+    }
+}
+
+@Composable
+private fun CatalogGroup(
+    title: String,
+    distros: List<DistroCatalog.Distro>,
+    busy: String?,
+    onDownload: (DistroCatalog.Distro) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+        Text(title, style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(6.dp))
+        distros.forEach { distro ->
+            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(distro.name, modifier = Modifier.weight(1f))
+                    OutlinedButton(
+                        enabled = busy == null,
+                        onClick = { onDownload(distro) },
+                    ) { Text(if (busy == distro.id) "下载中…" else "下载并安装") }
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
     }
 }
 

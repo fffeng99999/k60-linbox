@@ -6,13 +6,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.k60linbox.manager.data.BaseRepository
 import com.k60linbox.manager.data.ContainerRepository
+import com.k60linbox.manager.data.DistroRepository
 import com.k60linbox.manager.data.SettingsStore
 import com.k60linbox.manager.data.describe
+import com.k60linbox.manager.net.DistroCatalog
 import com.k60linbox.manager.runtime.BaseInfo
 import com.k60linbox.manager.runtime.ContainerInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -23,6 +26,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val bases = BaseRepository()
     private val settings = SettingsStore(app)
 
+    private var distroRepo: DistroRepository? = null
+
     data class State(
         val loading: Boolean = true,
         val busy: Boolean = false,
@@ -30,6 +35,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val bases: List<BaseInfo> = emptyList(),
         val prefs: SettingsStore.Snapshot? = null,
         val message: String? = null,
+        /** 正在下载的发行版 id；同时只允许一个下载任务。 */
+        val distroBusy: String? = null,
+        val distroProgress: Int = -1,
+        val distroStage: String = "",
     )
 
     private val _state = MutableStateFlow(State())
@@ -74,6 +83,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun createContainer(name: String, base: String, size: String, memMb: Int, host: String?, init: String?) =
         act("创建容器") { containers.create(name, base, size, memMb, host, init) }
+
+    /**
+     * 下载某个发行版并导入为 base。断点续传由 Downloader 负责，
+     * 中断后重按同一个按钮会从已下载的部分继续。
+     */
+    fun downloadDistro(distro: DistroCatalog.Distro) {
+        if (_state.value.distroBusy != null) return
+        viewModelScope.launch {
+            val mirror = settings.downloadMirror.first()
+            _state.update {
+                it.copy(distroBusy = distro.id, distroProgress = -1, distroStage = "解析下载地址")
+            }
+            val repo = distroRepo ?: DistroRepository(getApplication<Application>()).also { distroRepo = it }
+            val result = repo.downloadAndImport(distro, mirror) { progress ->
+                _state.update {
+                    it.copy(
+                        distroProgress = progress.percent,
+                        distroStage = if (progress.percent < 0) "下载中" else "下载中 ${progress.percent}%",
+                    )
+                }
+            }
+            val message = result.fold(
+                { outcome -> "${distro.name} 已导入为 ${outcome.baseName}（${outcome.archive}）" },
+                { throwable ->
+                    val hint = if (mirror != "official" && !DistroCatalog.hasDomesticMirror(distro)) {
+                        "；该发行版没有国内镜像，请在设置里把下载镜像站换成「官方源」"
+                    } else if (mirror != "official") {
+                        "；可到设置里把下载镜像站换成「官方源」再试"
+                    } else {
+                        ""
+                    }
+                    "下载失败：${throwable.describe()}$hint"
+                },
+            )
+            _state.update {
+                it.copy(distroBusy = null, distroProgress = -1, distroStage = "", message = message)
+            }
+            refresh()
+        }
+    }
 
     fun removeBase(name: String, force: Boolean) = act("删除发行版") {
         bases.remove(name, force)
