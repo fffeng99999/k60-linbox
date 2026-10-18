@@ -99,7 +99,44 @@ su -c 'linbox restore demo before-upgrade'   # 恢复前需先停止
 su -c 'linbox destroy demo'
 ```
 
-## 9. 内核补丁（解锁独立 PID 1）
+## 9. SSH 登录容器（可选）
+
+容器里装好 `openssh-server` 后，还要（1）由容器的 `init` 拉起 sshd，（2）用运行时的端口映射
+把它暴露出来。容器 `/init` 里加上：
+
+```sh
+mkdir -p /run/sshd
+[ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A
+[ -x /usr/sbin/sshd ] && /usr/sbin/sshd
+```
+
+> 坑：`linbox push` 是 `cp -a`，权限沿用源文件；而经 `adb push` 传上去的文件是 0644，
+> 直接推成 `/init` 会让容器「启动后立即退出」。先在宿主侧 `chmod 0755` 再 push。
+
+开放 root 登录（容器内执行）：
+
+```sh
+mkdir -p /etc/ssh/sshd_config.d
+printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/10-linbox.conf
+echo 'root:你的密码' | chpasswd
+mkdir -p /root/.ssh && chmod 700 /root/.ssh   # 想用密钥就再写入 authorized_keys(0600)
+su -c 'linbox port add demo tcp 8022 22'
+```
+
+从同一局域网的电脑连接（手机 IP 见「设置→关于手机→状态信息」，或 `ip -4 addr show wlan0`）：
+
+```sh
+ssh -p 8022 root@<手机IP>
+```
+
+- `手机IP:8022` 由 DNAT 转到容器 `172.30.0.10:22`；网络切换后 netd 会重刷防火墙，
+  失效时用 `su -c 'linbox port sync demo'` 重放映射。
+- 在手机本机上连 `8022` 无效（DNAT 只在 PREROUTING 生效，本机流量不经过它），
+  手机内部直接连 `172.30.0.10`（Android 自带没有 ssh 客户端，用 App 的终端或第三方客户端）。
+- 推荐改用密钥登录：公钥写进容器 `/root/.ssh/authorized_keys` 后，
+  把 `10-linbox.conf` 里的 `PasswordAuthentication yes` 去掉。
+
+## 10. 内核补丁（解锁独立 PID 1）
 
 ```bash
 # CI：手动触发 .github/workflows/build-kernel.yml
@@ -112,7 +149,7 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
 
 启动后 `linbox caps` 中 PID 命名空间应变为 `yes`，容器 init 即成为真正的 PID 1。
 
-## 10. 常见问题
+## 11. 常见问题
 
 - **镜像挂载报 I/O error**：设备 `/data` 为 f2fs，镜像文件必须带 `shell_data_file`
   标签；运行时每次启动都会自动 `chcon`。若手工移动过镜像，执行

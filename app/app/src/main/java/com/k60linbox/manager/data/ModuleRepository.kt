@@ -26,7 +26,7 @@ class ModuleRepository(private val context: Context) {
     data class InstallResult(val tag: String, val zipPath: String, val installedByCli: Boolean)
 
     suspend fun latest(): Result<ModuleRelease> = withContext(Dispatchers.IO) {
-        releases.latest(REPO).mapCatching { release ->
+        releases.latestWithAsset(REPO, MODULE_ASSET).mapCatching { release ->
             val asset = release.asset(MODULE_ASSET)
                 ?: throw IllegalStateException("该 Release 里没有 $MODULE_ASSET")
             ModuleRelease(release.tag, asset.url, asset.size)

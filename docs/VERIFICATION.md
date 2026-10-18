@@ -318,3 +318,28 @@ stdin/stdout。从 `adb shell`（或任何带 PTY 的终端）里执行 `start` 
 `mirrors.aliyun.com` 与 `ports.ubuntu.com` 同环境 200。
 App 的默认镜像站因此由 tuna 改为 aliyun（仍可在设置里切换）。
 
+### 14.6 容器崩溃退出会挡住下一次 start（`Cannot create namespace file ...: File exists`）
+
+若上一次不是走 `stop`，而是容器自己退出（例如 `/init` 缺失/不可执行），
+`/mnt/run/linbox-<名>` 这个 netns 文件会残留，且**不出现在 `ip netns list` 里**，
+下次 `start` 直接报：
+
+```text
+Cannot create namespace file "/mnt/run/linbox-ubuntu24": File exists
+[linbox] 错误(NET_NS): 无法创建网络命名空间 linbox-ubuntu24
+```
+
+修法（两层）：`cmd_start` 在启动前先把残留进程/网络命名空间/cgroup 回收一遍；
+`setup_net` 里 `ip netns add` 失败时先 `ip netns del` + 删半截 veth 再重试一次。
+复验：把 `/init` 换成不可执行文件制造崩溃，再 `start` 一次成功。
+
+### 14.7 `linbox exec <名> -- <命令>` 的参数是「拼接后整体交给 /bin/sh -c」
+
+`cmd_exec` 会把 `--` 之后的所有参数用空格拼成一个字符串，再作为**一个** `sh -c` 的参数执行。
+所以像 `linbox exec demo -- /bin/sh -c "a; b"` 这种写法会变成「再套一层 sh -c」，
+引号被二次解析后语义跑偏（实测 `mkdir -p /run/sshd` 被拆成 `mkdir` + 丢失 `-p`，
+`ss -lntp | grep :22` 静默无输出，容易误判成「sshd 没在监听」）。
+正确用法是把整条命令作为**一个**参数传：`linbox exec demo -- 'a; b'`，
+或干脆把脚本 push 进容器再 `linbox exec demo -- /bin/sh /root/x.sh`。
+
+

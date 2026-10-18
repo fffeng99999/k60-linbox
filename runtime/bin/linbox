@@ -546,8 +546,16 @@ setup_net() {
     _ns="linbox-$_name"
     _h="vlinbox${_idx}"
     _c="${_h}c"
-    ip netns list 2>/dev/null | grep -qx "$_ns" || \
-        ip netns add "$_ns" || fail NET_NS "无法创建网络命名空间 $_ns"
+    if ! ip netns list 2>/dev/null | grep -qx "$_ns"; then
+        # 残留的 netns 文件（容器崩溃退出、没走 stop 时留下）会让创建报
+        # "Cannot create namespace file ...: File exists"，而它又不出现在 ip netns list 里，
+        # 所以创建失败时先删掉残余文件与半截 veth 再重试一次。
+        if ! ip netns add "$_ns" 2>/dev/null; then
+            ip netns del "$_ns" 2>/dev/null || true
+            ip link del "$_h" 2>/dev/null || true
+            ip netns add "$_ns" || fail NET_NS "无法创建网络命名空间 $_ns"
+        fi
+    fi
     if ! ip link show "$_h" >/dev/null 2>&1; then
         ip link add "$_h" type veth peer name "$_c" || fail NET_VETH "无法创建 veth 对"
         ip link set "$_c" netns "$_ns"
@@ -847,8 +855,15 @@ cmd_start() {
     _rd="$(run_dir "$_name")"
     mkdir -p "$_rd" "$_cd/$MNT_NAME"
 
-    ensure_bridge
+    # 上一次可能是自己崩溃退出（init 缺失/不可执行等），没走 stop：残留的进程、网络
+    # 命名空间文件与 cgroup 会挡住这次启动（实测 "Cannot create namespace file ...:
+    # File exists"），所以先回收一遍。
     _idx="$(veth_index "$_name")"
+    kill_stragglers "$_name"
+    teardown_net "$_name" "$_idx"
+    teardown_cgroup "$_name"
+
+    ensure_bridge
     setup_net "$_name" "$IP" "$_idx"
     _cg="$(setup_cgroup "$_name" "$MEMORY_MB")"
     printf '%s\n' "linbox-$_name" > "$_rd/netns"

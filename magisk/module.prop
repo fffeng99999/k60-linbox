@@ -1,6 +1,6 @@
 id=k60_linbox
 name=K60 LinBox 系统容器（最接近虚拟机）
-version=0.1.0
-versionCode=1
+version=0.1.1
+versionCode=2
 author=k60-linbox contributors
 description=设备端 Linux 系统容器运行时（独立 rootfs / 网络 / 主机名 / cgroup，打内核补丁后含独立 PID 1）。默认不自动启动容器，具备启动失败自动禁用逻辑。
