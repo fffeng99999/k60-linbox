@@ -6,16 +6,23 @@ k60-linbox 的「容器拥有独立 PID 1」依赖内核命名空间。设备原
 
 ## 1. 需要打开的选项
 
-| 选项 | 原厂状态 | 作用 |
-|---|---|---|
-| `CONFIG_PID_NS` | `not set` | 容器独立的 PID 命名空间 → 发行版 init 成为真正的 PID 1 |
-| `CONFIG_IPC_NS` | `not set` | System V IPC 隔离（systemd / 数据库等需要） |
-| `CONFIG_USER_NS` | `not set` | 用户/能力隔离 |
-| `CONFIG_SYSVIPC` | `not set` | IPC_NS 的前置 |
-| `CONFIG_CGROUP_PIDS` | `not set` | 限制容器内进程数 |
-| `CONFIG_NAMESPACES` / `NET_NS` / `UTS_NS` / `CGROUPS` | 已 `=y` | 已在原厂配置中，无需改动 |
+| 选项 | 原厂状态 | 状态 | 作用 |
+|---|---|---|---|
+| `CONFIG_PID_NS` | `not set` | **已启用（实测可启动）** | 容器独立的 PID 命名空间 → 发行版 init 成为真正的 PID 1 |
+| `CONFIG_IPC_NS` | `not set` | 待隔离 | System V IPC 隔离（systemd / 数据库等需要） |
+| `CONFIG_USER_NS` | `not set` | 待隔离 | 用户/能力隔离 |
+| `CONFIG_SYSVIPC` | `not set` | 待隔离 | IPC_NS 的前置 |
+| `CONFIG_CGROUP_PIDS` | `not set` | 待隔离 | 限制容器内进程数 |
+| `CONFIG_NAMESPACES` / `NET_NS` / `UTS_NS` / `CGROUPS` | 已 `=y` | — | 原厂配置已开，无需改动 |
 
-`kernel/scripts/build_kernel.sh` 会自动把这些选项打开，其余配置保持设备原样。
+> **设备实测（重要）**：把上面 5 项**全部**打开后编出的内核 **无法启动**——
+> `fastboot boot` 报告 OKAY，但设备实际跑回已刷入的原厂内核
+> （`/proc/config.gz` 与设备原厂 config 完全一致，`CONFIG_PID_NS` 仍 `not set`，
+> 无 panic、无 pstore 记录）。而只启用 `PID_NS` 的内核可以正常启动。
+> 因此当前 `build_kernel.sh` 只启用 `PID_NS`；其余几项需要逐项隔离后再加，
+> 结论与证据见 `docs/VERIFICATION.md`。
+
+`kernel/scripts/build_kernel.sh` 会自动把启用的选项打开，其余配置保持设备原样。
 
 ## 2. 构建
 

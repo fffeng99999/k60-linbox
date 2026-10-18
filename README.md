@@ -35,13 +35,16 @@ VM 高度一致。
 | 能力 | 原厂内核 | 打 k60-linbox 内核补丁后 |
 |---|---|---|
 | mnt / net / uts / cgroup 命名空间 | ✅ | ✅ |
-| **PID / IPC / USER 命名空间** | ❌ 未编译 | ✅ |
+| **PID 命名空间** | ❌ 未编译 | ✅ **已上机验证** |
+| IPC / USER 命名空间 | ❌ 未编译 | ⏳ 逐项隔离中 |
 | cgroup v2 | 仅 `memory` 控制器 | 不变（Android 布局） |
 | ext4 镜像 / veth / bridge / NAT | ✅ | ✅ |
-| 发行版 init 作为真正 PID 1 | ❌ | ✅ |
+| 发行版 init 作为真正 PID 1 | ❌ | ✅ **已上机验证（init 自报 PID=1）** |
 
-结论：**不打补丁也能用**（独立 rootfs/网络/主机名/cgroup），但要做「独立 init、最像 VM」，
-需要用 `kernel/` 里的配置级补丁自编译内核，再 `fastboot boot` 临时启动（不刷分区）。
+结论：**不打补丁也能用**（独立 rootfs/网络/主机名/cgroup）；打了只启用 `PID_NS` 的
+补丁内核后，容器**已经拥有真正的独立 PID 1**（设备实测）。`IPC_NS/USER_NS/SYSVIPC/
+CGROUP_PIDS` 同时打开会让内核无法启动，需要逐项隔离，详见
+[docs/VERIFICATION.md](docs/VERIFICATION.md)。
 
 ## 快速开始
 

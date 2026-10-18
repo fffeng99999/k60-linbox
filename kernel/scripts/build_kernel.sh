@@ -46,8 +46,11 @@ gzip -dc "$CONFIG_GZ" > "$KERNEL_SRC/.config"
 
 # 2. 打开容器所需命名空间（本项目的核心补丁）。
 #
-# 隔离测试：先只加 PID_NS（其余 NAMESPACES/NET_NS/UTS_NS/CGROUPS 原厂已 =y），
-# 用于判定究竟是哪一项导致补丁内核无法启动。确认后再逐步加回 IPC_NS/USER_NS 等。
+# 设备实测：单独启用 PID_NS 即可让容器获得独立 PID 1（已实测 init 自报 PID=1）
+# 且内核能正常启动。但完整组合 IPC_NS + USER_NS + SYSVIPC + CGROUP_PIDS 会让该
+# 内核无法启动——fastboot boot 会静默回落到已刷入的原厂内核（/proc/config.gz 与
+# 原厂完全一致、无 panic 记录）。因此这里只启用 PID_NS，其余项待逐项隔离后再加。
+# 详见 docs/VERIFICATION.md。
 for opt in PID_NS; do
     "$KERNEL_SRC/scripts/config" --file "$KERNEL_SRC/.config" --enable "$opt"
 done

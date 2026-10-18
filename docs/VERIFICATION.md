@@ -131,9 +131,56 @@ destroy → 清理干净；网桥与 NAT 规则手工清理                     
    另外，在宿主预挂 loop 后到子命名空间挂载同样报 `I/O error`，而在子命名空间内
    `mount -o loop` 正常且不残留 loop 设备。运行时的实现遵循这些实测结论。
 
-## 10. 尚未验证（需要内核补丁）
+## 10. 内核补丁与独立 PID 1 实测（已完成）
 
-- PID 命名空间可用后，容器 init 是否如预期成为真正的 PID 1。
-- IPC / USER 命名空间对 systemd 的实际支持程度。
+### 10.1 fastboot boot 有效，但完整补丁组合会导致内核不启动
 
-这两项要在 `kernel/` 的自编译内核 `fastboot boot` 之后才能验证。
+把 `PID_NS + IPC_NS + USER_NS + SYSVIPC + CGROUP_PIDS` 全部打开后编出的内核：
+
+```text
+fastboot boot → Booting OKAY
+启动后 /proc/config.gz 与设备原厂 config 完全一致（CONFIG_PID_NS 仍 not set）
+/proc/self/ns 无 pid；unshare -p 仍 Invalid argument
+ro.boot.bootreason = bootloader；/sys/fs/pstore 为空（无 panic）
+```
+
+即设备**实际跑回已刷入的原厂内核**，该镜像未被采用。
+对照实验：只启用 `PID_NS` 的同源内核（同为 Thin LTO）**可以正常启动**，
+`CONFIG_LTO_CLANG_THIN=y`、`/proc/self/ns` 出现 `pid`/`pid_for_children`、
+`CONFIG_PID_NS=y`。
+
+另外确认了两个排除项：镜像 sha256 与 CI 记录完全一致（排除下载损坏）；
+ramdisk 与旧内核镜像逐字节相同（排除 ramdisk 差异）。
+
+### 10.2 独立 PID 1 实测（已被设备证明）
+
+只启用 `PID_NS` 的内核上运行容器：
+
+```text
+linbox caps        → PID 命名空间 yes
+linbox start demo  → [linbox] 进入容器 demo: host=demo pid1=yes
+                     [linbox] 容器 demo 已启动 (unshare pid=11323, container pid=11328)
+容器 PID 1（宿主 pid 11328）：
+  pid ns   = pid:[4026535285]（与宿主 4026531836 不同）
+  根目录    = bin dev etc init lost+found pid1.txt proc run sbin sys tmp
+  init 自报 = init-pid=1
+  UTS      = demo
+网络       = vlinbox1c, inet 172.30.0.10/24
+stop/destroy → loop=0 proc=0（零残留）
+```
+
+**结论：容器拥有独立的 PID 1，即「最接近虚拟机」的核心目标已在设备上成立。**
+
+### 10.3 运行时在 PID 命名空间下暴露并已修复的问题
+
+1. `unshare -p -f` 会再 fork 出真正的容器 PID 1，原先只记录了 `unshare` 父进程，
+   导致 `stop` 收不干净。现通过 `pgrep -P` 定位子进程，并把它与父进程都纳入
+   cgroup，停止时以 cgroup 成员为准回收。
+2. 容器镜像的 loop 设备在退出后残留：现改为**先 `nsenter` 进容器挂载命名空间
+   `umount` 再杀进程**，并保留 `losetup -d` 重试作为兜底。
+
+## 11. 尚未验证
+
+- `IPC_NS` / `USER_NS` / `SYSVIPC` / `CGROUP_PIDS` 中究竟是哪一项（或组合）
+  导致内核无法启动——需要逐项隔离构建。
+- systemd 作为容器 init 的完整可用性（依赖上面几项）。
