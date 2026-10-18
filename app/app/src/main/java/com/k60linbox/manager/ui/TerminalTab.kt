@@ -110,7 +110,9 @@ private fun TerminalView(
             val bridge = TerminalBridge(
                 onInput = { bytes -> session.write(bytes) },
                 onReady = { cols, rows ->
+                    Log.i(TAG, "onReady: $cols x $rows")
                     session.onOutput = { bytes ->
+                        Log.i(TAG, "feed: ${bytes.size} 字节 -> JS")
                         val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
                         mainHandler.post {
                             webView.evaluateJavascript(
@@ -120,6 +122,7 @@ private fun TerminalView(
                         }
                     }
                     session.onExit = { code ->
+                        Log.i(TAG, "onExit: $code")
                         mainHandler.post {
                             webView.evaluateJavascript(
                                 "window.linboxExit && window.linboxExit($code)",

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 package com.k60linbox.manager.term
 
+import android.util.Log
 import com.k60linbox.manager.runtime.Linbox
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
@@ -19,6 +20,7 @@ class TerminalSession(private val containerName: String) {
     private companion object {
         /** Ctrl-D：交互式 shell 收到它就当作 EOF。 */
         const val EOF: Int = 4
+        const val TAG = "k60linbox-term"
     }
 
     private var process: Process? = null
@@ -41,37 +43,48 @@ class TerminalSession(private val containerName: String) {
 
     /** 用终端给的行列数启动会话；busybox script 之后无法改窗口大小，所以只设置一次。 */
     fun start(cols: Int, rows: Int) {
-        if (process != null) return
+        if (process != null) {
+            Log.i(TAG, "start: 忽略，会话已在运行")
+            return
+        }
         val command = "${Linbox.bin()} attach ${Linbox.quote(containerName)} --cols $cols --rows $rows"
+        Log.i(TAG, "start: $command")
         val started = try {
             ProcessBuilder("su", "-c", command)
                 .redirectErrorStream(true)
                 .apply { environment()["TERM"] = "xterm-256color" }
                 .start()
         } catch (t: Throwable) {
+            Log.i(TAG, "start: 失败 $t")
             onLog?.invoke("启动终端失败: ${t.message}")
             return
         }
         process = started
+        Log.i(TAG, "start: pid=${started.pid()}")
 
         reader = thread(name = "linbox-term-$containerName", isDaemon = true) {
             val buffer = ByteArray(8192)
+            var total = 0L
             try {
                 started.inputStream.use { input ->
                     while (!closed) {
                         val read = input.read(buffer)
+                        Log.i(TAG, "read: $read 字节")
                         if (read <= 0) break
+                        total += read
                         onOutput?.invoke(buffer.copyOf(read))
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
                 // 会话被关掉时 read 会抛异常，属于正常路径
+                Log.i(TAG, "read: 循环结束 $t")
             }
             val code = try {
                 started.waitFor()
             } catch (_: Throwable) {
                 -1
             }
+            Log.i(TAG, "exit: code=$code 共收 $total 字节 closed=$closed")
             if (!closed) onExit?.invoke(code)
         }
     }
