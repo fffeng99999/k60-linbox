@@ -828,6 +828,10 @@ cmd_enter() {
     mount -t tmpfs tmpfs "$_mnt/run" 2>/dev/null || true
     mount -t tmpfs tmpfs "$_mnt/tmp" 2>/dev/null || true
 
+    # 发行版自己的 init 会按 /etc/hostname 重设主机名，把运行时设的 UTS 主机名覆盖掉：
+    # 实测 systemd 当 init 时会把 ubuntu24 改回镜像默认的 localhost.localdomain。
+    # 每次进入都按配置写一遍，脚本 init 与 systemd 两种情况下名字才一致。
+    printf '%s\n' "$HOSTNAME" > "$_mnt/etc/hostname" 2>/dev/null || true
     hostname "$HOSTNAME" 2>/dev/null || true
     log "进入容器 $_name: host=$HOSTNAME pid1=$([ "$$" = 1 ] && printf yes || printf no)"
     exec chroot "$_mnt" "$INIT"

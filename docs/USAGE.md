@@ -101,8 +101,10 @@ su -c 'linbox destroy demo'
 
 ## 9. SSH 登录容器（可选）
 
-容器里装好 `openssh-server` 后，还要（1）由容器的 `init` 拉起 sshd，（2）用运行时的端口映射
-把它暴露出来。容器 `/init` 里加上：
+容器里装好 `openssh-server` 后，还要（1）让 sshd 被拉起来，（2）用运行时的端口映射把它暴露出来。
+
+- **用 systemd 当 init**（见 §10）：发行版默认已启用 `ssh.socket`，开容器即自动监听，不用做任何事。
+- **用脚本 `/init`**：把下面几行加进容器 `/init`：
 
 ```sh
 mkdir -p /run/sshd
@@ -136,7 +138,38 @@ ssh -p 8022 root@<手机IP>
 - 推荐改用密钥登录：公钥写进容器 `/root/.ssh/authorized_keys` 后，
   把 `10-linbox.conf` 里的 `PasswordAuthentication yes` 去掉。
 
-## 10. 内核补丁（解锁独立 PID 1）
+## 10. 用发行版自带 init（systemd）
+
+默认 init 是极简脚本（`/init`）；也可以让容器跑发行版真正的 init：
+
+```sh
+su -c 'linbox exec demo -- /bin/sh -c "apt-get install -y systemd systemd-sysv"'
+su -c 'linbox stop demo'
+su -c 'linbox set demo --init /sbin/init'
+su -c 'linbox start demo'
+```
+
+实测（K60，内核只补了 `PID_NS`）：**systemd 255 能正常起来**——
+`systemctl is-system-running` = `running`、0 个 failed 单元，
+`ssh`（socket 激活）、`dbus`、`systemd-logind`、`systemd-journald` 都在运行；
+内存限额仍生效（systemd 建的子 cgroup 都落在运行时的 `linbox_<名>` 之下）。
+
+已知限制（内核层面，非 systemd 版本问题）：
+
+| 限制 | 影响 |
+|---|---|
+| 内核无 `CONFIG_SYSVIPC` / `POSIX_MQUEUE` | 用到 SysV IPC / POSIX 消息队列的服务会失败（如部分数据库）；systemd 自身不需要 |
+| 内核无 `USER_NS` / `CGROUP_PIDS` | `unshare -U`、`TasksMax` 等不可用 |
+| cgroup 为混合模式（Android 的 cpu/blkio 仍在 v1） | systemd 自标 `tainted: cgroupsv1`，不影响使用 |
+| 没有 udev | `dev-*.device` 单元长期停在 `tentative`，不影响 `is-system-running` |
+| systemd 把本机识别为虚拟机（`vm-other`） | 会为不存在的 `hvc0` 起 getty 并卡 90 秒；`systemctl mask serial-getty@hvc0.service` 一次即可 |
+
+容器重启后 systemd 的 `/etc/hostname` 会覆盖运行时设的 UTS 主机名，
+运行时会在每次进入前按配置重写 `/etc/hostname`，两边名字保持一致。
+
+回退到脚本 init：`su -c 'linbox set demo --init /init'`（原 `/init` 仍在镜像里）。
+
+## 11. 内核补丁（解锁独立 PID 1）
 
 ```bash
 # CI：手动触发 .github/workflows/build-kernel.yml
@@ -149,7 +182,7 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
 
 启动后 `linbox caps` 中 PID 命名空间应变为 `yes`，容器 init 即成为真正的 PID 1。
 
-## 11. 常见问题
+## 12. 常见问题
 
 - **镜像挂载报 I/O error**：设备 `/data` 为 f2fs，镜像文件必须带 `shell_data_file`
   标签；运行时每次启动都会自动 `chcon`。若手工移动过镜像，执行

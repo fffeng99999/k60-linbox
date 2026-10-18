@@ -183,7 +183,8 @@ stop/destroy → loop=0 proc=0（零残留）
 
 - `IPC_NS` / `USER_NS` / `SYSVIPC` / `CGROUP_PIDS` 中究竟是哪一项（或组合）
   导致内核无法启动——需要逐项隔离构建。
-- systemd 作为容器 init 的完整可用性（依赖上面几项）。
+- ~~systemd 作为容器 init 的完整可用性（依赖上面几项）~~ → **已于 §15 实测可行**：
+  只补 `CONFIG_PID_NS` 就够，`SYSVIPC`/`IPC_NS`/`USER_NS` 并非 systemd 启动的前提。
 
 ## 12. 容器网络打通（Android netd 策略路由）
 
@@ -341,5 +342,43 @@ Cannot create namespace file "/mnt/run/linbox-ubuntu24": File exists
 `ss -lntp | grep :22` 静默无输出，容易误判成「sshd 没在监听」）。
 正确用法是把整条命令作为**一个**参数传：`linbox exec demo -- 'a; b'`，
 或干脆把脚本 push 进容器再 `linbox exec demo -- /bin/sh /root/x.sh`。
+
+## 15. systemd 作为容器 init 实测可行（2026-10-19，推翻 §1/§6/§11 的悲观假设）
+
+§1/§6 曾推断「systemd 场景需要 `IPC_NS`/`USER_NS`/`SYSVIPC`」，§11 把「systemd 作为容器 init 的
+完整可用性」列为未验证。实际做法是：容器内 `apt-get install -y systemd systemd-sysv`，
+再把容器 `--init` 改成 `/sbin/init`，其余不改。
+
+实测结果（Ubuntu 24.04 容器，内核仍只补了 `CONFIG_PID_NS=y`）：
+
+```text
+/proc/1/cmdline            /sbin/init                        ← systemd 255 就是 PID 1
+systemctl is-system-running running
+systemctl --failed          0 loaded units listed
+运行中的服务                dbus.service / ssh.service（socket 激活） /
+                           systemd-logind.service / systemd-journald.service
+systemd-detect-virt         vm-other
+/proc/1/cgroup              0::/linbox_ubuntu24               ← 子 cgroup 全在本容器之下
+宿主 /sys/fs/cgroup/linbox_ubuntu24  cgroup.procs=2、memory.current≈7MB、memory.max 生效
+宿主 cgroup.subtree_control 仍只有 memory（未被 systemd 改动），宿主布局无新增顶层目录
+```
+
+即：**只补 `PID_NS` 就足以让 systemd 正常当 PID 1**；它并不需要 `SYSVIPC`/`IPC_NS`/`USER_NS`
+才能启动。默认状态下 `systemd` 会自己挂 cgroup2（`/sys/fs/cgroup/unified`）并复用 Android 已有的
+v1 控制器，故自标 `tainted: cgroupsv1`——不影响使用。
+
+过程中修掉的一个真实回归与三个已知限制：
+
+1. **主机名被改掉**：systemd 按 `/etc/hostname` 重设主机名，把运行时设的 UTS 名字
+   （`ubuntu24`）覆盖成镜像默认的 `localhost.localdomain`。修法：`cmd_enter` 在 chroot 前
+   按配置重写 `$_mnt/etc/hostname`，脚本 init 与 systemd 两种情况下名字一致。
+2. `systemd-detect-virt` = `vm-other`（不是容器），于是 systemd 会为不存在的 `hvc0`
+   起 getty 并等 90 秒超时。屏蔽 `serial-getty@hvc0.service` 后重启即直接 `running`。
+3. 无 udev → `dev-*.device` 单元长期 `tentative`（不阻塞 `is-system-running`）。
+4. 无 `SYSVIPC`/`POSIX_MQUEUE`/`USER_NS`/`CGROUP_PIDS` → 依赖 SysV IPC/POSIX mqueue/用户
+   命名空间的服务会失败；systemd 本身不需要。
+
+容器停止后仍然零残留：loop=0、`linbox_<名>` cgroup 已删除、无容器 root 的残留进程。
+
 
 
