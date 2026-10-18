@@ -29,10 +29,8 @@ class SettingsStore(private val context: Context) {
         val defaultInit = stringPreferencesKey("default_init")
     }
 
+    /** 首次引导是否已完成；没写过的键按 false 处理（加载态由调用方用「是否已收到首个值」判断）。 */
     val onboarded: Flow<Boolean> = context.settingsDataStore.data.map { it[Keys.onboarded] ?: false }
-
-    /** null 表示还没读出来，用于决定导航起点时先显示加载态。 */
-    val onboardedOrNull: Flow<Boolean?> = context.settingsDataStore.data.map { it[Keys.onboarded] }
     val downloadMirror: Flow<String> = context.settingsDataStore.data.map { it[Keys.downloadMirror] ?: MirrorPresets.DEFAULT }
     val aptMirror: Flow<String> = context.settingsDataStore.data.map { it[Keys.aptMirror] ?: MirrorPresets.DEFAULT }
     val monitorEnabled: Flow<Boolean> = context.settingsDataStore.data.map { it[Keys.monitorEnabled] ?: false }

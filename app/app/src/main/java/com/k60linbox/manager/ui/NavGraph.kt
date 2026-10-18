@@ -3,16 +3,19 @@ package com.k60linbox.manager.ui
 
 import android.net.Uri
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.k60linbox.manager.data.SettingsStore
+import kotlinx.coroutines.flow.catch
 
 object Routes {
     const val ONBOARDING = "onboarding"
@@ -32,10 +35,27 @@ object Routes {
 fun AppRoot() {
     val context = LocalContext.current
     val settings = remember(context) { SettingsStore(context.applicationContext) }
-    val onboarded by settings.onboardedOrNull.collectAsStateWithLifecycle(initialValue = null)
 
-    val done = onboarded
-    if (done == null) {
+    // 注意：不能拿「读到的值是否为 null」当加载态——首次安装时 DataStore 读得到空 Preferences，
+    // onboarded 本身就是 null，那样会永远停在加载页（真机实测踩到过）。
+    // 所以单独用一个 loaded 标记来区分「还没读到」与「读到 false」。
+    var loaded by remember { mutableStateOf(false) }
+    var onboarded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        settings.onboarded
+            .catch {
+                // 读设置失败就当作没引导过，进入引导页，别把用户锁在加载页
+                loaded = true
+                onboarded = false
+            }
+            .collect {
+                onboarded = it
+                loaded = true
+            }
+    }
+
+    if (!loaded) {
         LoadingScreen()
         return
     }
@@ -43,7 +63,7 @@ fun AppRoot() {
     val nav = rememberNavController()
     NavHost(
         navController = nav,
-        startDestination = if (done) Routes.MAIN else Routes.ONBOARDING,
+        startDestination = if (onboarded) Routes.MAIN else Routes.ONBOARDING,
     ) {
         composable(Routes.ONBOARDING) {
             OnboardingScreen(onFinish = {})
