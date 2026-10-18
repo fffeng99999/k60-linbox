@@ -51,12 +51,32 @@ python3 kernel/scripts/repack_boot.py \
 
 ## 4. 验证与回滚
 
+先临时启动（只从 RAM 启动，不写分区）：
+
 ```powershell
-# 临时启动（只从 RAM 启动，不写分区）
 fastboot boot boot-linbox.img
-# 回滚：重启即回到原内核；或刷回备份
+```
+
+确认能正常启动、`/proc/self/ns` 出现 `pid`、`CONFIG_PID_NS=y`、root 正常之后，
+可以刷入使其持久生效（**会写分区**，务必先备份当前 boot 分区）：
+
+```powershell
+# 刷入前先导出可回滚的当前 boot_a
+adb shell su -c 'dd if=/dev/block/by-name/boot_a of=/data/local/tmp/boot_a_current.img bs=1M'
+adb pull /data/local/tmp/boot_a_current.img boot_a_current.img
+
+adb reboot bootloader
+fastboot flash boot_a boot-linbox.img
+fastboot reboot
+
+# 回滚（任选其一）
+fastboot flash boot_a boot_a_current.img
 fastboot flash boot_a .\k60-stock-backup\k60_stock_backup\boot_a.img
 ```
+
+> 实测：`fastboot flash boot_a` 在解锁设备上可用，刷入后重启仍是补丁内核，
+> `CONFIG_PID_NS=y`、容器 `pid1=yes`，root 与 SELinux Enforcing 均正常。
+> 注意 `fastboot boot` 与 `fastboot flash` 不是一回事：前者只在本次启动生效。
 
 启动后应能看到：
 
