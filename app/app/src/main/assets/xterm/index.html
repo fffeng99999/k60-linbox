@@ -35,20 +35,37 @@
       try { LinboxBridge.log(String(msg)); } catch (e) { }
     }
 
+    // 页面级异常也要上报，否则渲染失败时这里一片静默
+    window.addEventListener('error', function (e) {
+      log('JS error: ' + (e && e.message ? e.message : e));
+    });
+
     function toBase64(bytes) {
       var s = '';
       for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
       return btoa(s);
     }
 
+    function box(el) {
+      if (!el) return 'none';
+      return el.clientWidth + 'x' + el.clientHeight;
+    }
+
     // Kotlin -> 终端：xterm 的 write 接受 Uint8Array，会自行做 UTF-8 解码，
     // 因此跨 chunk 切断的多字节字符也能正确拼回来。
     window.linboxFeed = function (base64) {
-      if (!term) return;
-      var bin = atob(base64);
-      var bytes = new Uint8Array(bin.length);
-      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      term.write(bytes);
+      try {
+        if (!term) { log('feed: term 还没建好，丢弃 ' + base64.length + ' 字符'); return; }
+        var bin = atob(base64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        term.write(bytes);
+        log('feed: 已写入 ' + bytes.length + ' 字节 | 行数=' + term.buffer.active.length +
+            ' 光标=' + term.buffer.active.cursorX + ',' + term.buffer.active.cursorY +
+            ' | 屏=' + box(term.element) + ' | visible=' + document.visibilityState);
+      } catch (e) {
+        log('feed 异常: ' + e);
+      }
     };
 
     window.linboxExit = function (code) {
@@ -73,14 +90,19 @@
       }
       started = true;
 
-      term = new Terminal({
-        fontSize: FONT_SIZE,
-        cursorBlink: true,
-        scrollback: 2000,
-        theme: { background: '#000000', foreground: '#e6e6e6' }
-      });
-      term.open(document.getElementById('t'));
-      window.term = term;
+      try {
+        term = new Terminal({
+          fontSize: FONT_SIZE,
+          cursorBlink: true,
+          scrollback: 2000,
+          theme: { background: '#000000', foreground: '#e6e6e6' }
+        });
+        term.open(document.getElementById('t'));
+        window.term = term;
+      } catch (e) {
+        log('终端初始化失败: ' + e);
+        return;
+      }
 
       term.onData(function (data) {
         try { LinboxBridge.write(toBase64(encoder.encode(data))); } catch (e) { }
@@ -96,11 +118,24 @@
         rows = FALLBACK_ROWS;
       }
       term.resize(cols, rows);
+      var t = document.getElementById('t');
       log('viewport ' + size[0] + 'x' + size[1] + ' -> ' + cols + 'x' + rows + ' (try ' + attempt + ')');
+      log('open OK | 容器=' + box(t) + ' | xterm=' + box(term.element) +
+          ' | 行容器=' + box(document.querySelector('.xterm-rows')) +
+          ' | 屏=' + box(document.querySelector('.xterm-screen')) +
+          ' | renderer=' + (term._core && term._core._renderService ? 'yes' : 'no'));
 
       // 只报一次：busybox script 不支持会话中途 resize
       try { LinboxBridge.ready(cols, rows); } catch (e) { }
       term.focus();
+
+      // 自证：不走 PTY，直接往终端写一行，验证渲染通路是否通
+      setTimeout(function () {
+        try {
+          term.write('\u001b[36m[k60-linbox] 终端渲染自检\u001b[0m\r\n$ ');
+          log('selftest: 已写入自检文本');
+        } catch (e) { log('selftest 异常: ' + e); }
+      }, 300);
     }
 
     if (document.readyState === 'complete') start(0);
