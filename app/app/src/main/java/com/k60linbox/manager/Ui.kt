@@ -85,7 +85,10 @@ fun LinboxApp(vm: LinboxViewModel = viewModel()) {
         CreateDialog(
             bases = state.bases,
             onDismiss = { createOpen = false },
-            onCreate = { args -> vm.run(*args); createOpen = false },
+            onCreate = { args ->
+                vm.run(*args.toTypedArray())
+                createOpen = false
+            },
         )
     }
 
