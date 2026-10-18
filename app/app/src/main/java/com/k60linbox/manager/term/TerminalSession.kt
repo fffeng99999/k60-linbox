@@ -60,7 +60,7 @@ class TerminalSession(private val containerName: String) {
             return
         }
         process = started
-        Log.i(TAG, "start: pid=${started.pid()}")
+        Log.i(TAG, "start: 进程已启动")
 
         reader = thread(name = "linbox-term-$containerName", isDaemon = true) {
             val buffer = ByteArray(8192)
