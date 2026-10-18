@@ -22,7 +22,7 @@
 #          exec / shell / attach / set / resize / log
 #          snapshot / restore / snapshot-list / snapshot-rm
 #   网络   port add|del|list|sync
-#   其他   mirror / push / pull / autostart add|del|list|clea
+#   其他   mirror / push / pull / autostart add|del|list|clear
 
 set -u
 
@@ -1215,6 +1215,47 @@ container_root() {
     fi
 }
 
+# 列出容器里的目录内容（运行中经 /proc/<pid>/root，停止态临时挂载镜像）。
+cmd_ls() {
+    _name=${1:-}; shift || true
+    _path="/"
+    while [ $# -gt 0 ]; do
+        _k=$1; shift
+        case "$_k" in
+            --path|-p) _path=${1:-/}; [ $# -gt 0 ] && shift || true ;;
+            *) fail BAD_ARGS "未知参数: $_k" ;;
+        esac
+    done
+    load_config "$_name"
+    container_root "$_name"
+    _temp_mnt="$_CONT_MOUNTED"
+    _target="$_root$_path"
+    if [ ! -d "$_target" ]; then
+        [ "$_temp_mnt" = 1 ] && image_umount_host "$_name"
+        fail NO_PATH "目录不存在: $_path"
+    fi
+
+    _arr=""
+    for _e in "$_target"/* "$_target"/.[!.]*; do
+        [ -e "$_e" ] || continue
+        _bn="$(basename "$_e")"
+        _t=file
+        [ -L "$_e" ] && _t=link
+        [ -d "$_e" ] && _t=di
+        _sz="$(stat -c %s "$_e" 2>/dev/null || printf 0)"
+        _mode="$(stat -c %a "$_e" 2>/dev/null || printf '?')"
+        if [ "$J" = "1" ]; then
+            [ -n "$_arr" ] && _arr="$_arr,"
+            _arr="$_arr{\"name\":\"$(json_escape "$_bn")\",\"type\":\"$_t\",\"size\":$_sz,\"mode\":\"$_mode\"}"
+        else
+            printf '%s\t%s\t%s\t%s\n' "$_t" "$_mode" "$_sz" "$_bn"
+        fi
+    done
+    [ "$_temp_mnt" = 1 ] && image_umount_host "$_name"
+    emit "{\"path\":\"$(json_escape "$_path")\",\"entries\":[$_arr]}"
+    return 0
+}
+
 cmd_push() {
     _name=""; _a=""; _b=""
     while [ $# -gt 0 ]; do
@@ -1430,14 +1471,15 @@ k60-linbox - 最接近虚拟机的 Android 系统容器运行时
 发行版 base add|import|list|remove
 容器   create <名> --base <名> [--size 4G] [--mem 2048] [--host 名] [--ip 地址] [--init 路径]
        list | start <名> | stop <名> | restart <名> | status [名] | destroy <名>
-       exec <名> -- <命令> | shell <名> | attach <名> | log <名> [-n 行] [-f] [--json]
+       exec <名> -- <命令> | shell <名> | log <名> [-n 行] [-f] [--json]
+       attach <名> [--cols 列] [--rows 行]
        set <名> [--mem 兆] [--ip 地址] [--host 名] [--init 路径] [--autostart 0|1]
        resize <名> --size 8G
        snapshot <名> <标签> | restore <名> <标签> | snapshot-list <名> | snapshot-rm <名> <标签>
 网络   port add|del|list|sync <名> [协议 宿主端口 容器端口]
        mirror <名> <tuna|aliyun|ustc|official>
-文件   push <名> <宿主路径> <容器路径> | pull <名> <容器路径> <宿主路径>
-其他   autostart add|del|list|clea
+文件   ls <名> [--path 目录] | push <名> <宿主路径> <容器路径> | pull <名> <容器路径> <宿主路径>
+其他   autostart add|del|list|clear
 USAGE
 }
 
@@ -1507,6 +1549,7 @@ case "$_cmd" in
     mirror)                     cmd_mirror "$@" ;;
     push)                       cmd_push "$@" ;;
     pull)                       cmd_pull "$@" ;;
+    ls)                         cmd_ls "$@" ;;
     log|logs)                   cmd_log "$@" ;;
     autostart)                  cmd_autostart "$@" ;;
     __enter)                    cmd_enter "${1:-}" ;;

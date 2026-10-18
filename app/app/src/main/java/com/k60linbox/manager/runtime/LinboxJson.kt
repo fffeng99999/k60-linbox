@@ -125,6 +125,25 @@ data class SnapshotInfo(
     val path: String = "",
 )
 
+/** 容器里的一个目录项。 */
+@Serializable
+data class FileEntry(
+    val name: String,
+    /** dir / file / link */
+    val type: String = "file",
+    val size: Long = 0,
+    val mode: String = "",
+) {
+    val isDir: Boolean get() = type == "dir"
+}
+
+/** `linbox ls` 的结果。 */
+@Serializable
+data class FileListing(
+    val path: String = "/",
+    val entries: List<FileEntry> = emptyList(),
+)
+
 /** 容器内执行命令的结果。 */
 @Serializable
 data class ExecResult(

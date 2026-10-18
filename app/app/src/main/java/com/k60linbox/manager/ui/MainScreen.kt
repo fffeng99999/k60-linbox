@@ -4,7 +4,6 @@ package com.k60linbox.manager.ui
 import android.app.Application
 import android.content.Context
 import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -53,6 +52,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.k60linbox.manager.data.copyUriTo
+import com.k60linbox.manager.data.uriDisplayName
 import com.k60linbox.manager.net.DistroCatalog
 import com.k60linbox.manager.net.MirrorPresets
 import com.k60linbox.manager.runtime.BaseInfo
@@ -544,20 +545,10 @@ private data class PendingImport(val path: String, val suggestedName: String)
 /** 把 SAF 选中的归档复制到应用缓存目录，返回 root 可读的路径与建议的 base 名。 */
 private suspend fun prepareImport(context: Context, uri: Uri): PendingImport? = withContext(Dispatchers.IO) {
     runCatching {
-        val display = displayName(context, uri) ?: "distro"
         val target = File(context.cacheDir, "linbox-import-${System.currentTimeMillis()}.archive")
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            target.outputStream().use { output -> input.copyTo(output) }
-        } ?: return@runCatching null
-        PendingImport(target.absolutePath, sanitizeName(display))
+        copyUriTo(context, uri, target)
+        PendingImport(target.absolutePath, sanitizeName(uriDisplayName(context, uri) ?: "distro"))
     }.getOrNull()
-}
-
-/** 读取 SAF 的显示名（用于建议 base 名）。 */
-private fun displayName(context: Context, uri: Uri): String? {
-    val cursor = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-    cursor?.use { if (it.moveToFirst() && it.columnCount > 0) return it.getString(0) }
-    return uri.lastPathSegment
 }
 
 /** base 名只允许字母数字/短横线/下划线，故把压缩包名清洗成合法名字。 */

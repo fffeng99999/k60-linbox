@@ -4,9 +4,14 @@
 # 具备防 bootloop 逻辑：连续启动失败会写 disable 标记并自动停用。
 MODDIR=${0%/*}
 STATE=/data/adb/k60_linbox
+# 自启列表放在 /data/local/linbox/autostart（App 维护），模块重装不会丢；
+# 老路径 $MODDIR/autostart 仍兼容。
 LIST="$MODDIR/autostart"
+NEW_LIST=/data/local/linbox/autostart
+[ -f "$NEW_LIST" ] && LIST="$NEW_LIST"
 MAX_FAILURES=2
 LINBOX="$MODDIR/system/bin/linbox"
+[ -x "$LINBOX" ] || LINBOX="/data/local/bin/linbox"
 [ -x "$LINBOX" ] || LINBOX="/system/bin/linbox"
 
 mkdir -p "$STATE" 2>/dev/null

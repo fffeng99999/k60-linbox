@@ -8,8 +8,12 @@ import androidx.lifecycle.viewModelScope
 import com.k60linbox.manager.data.ContainerRepository
 import com.k60linbox.manager.data.PortRepository
 import com.k60linbox.manager.data.SnapshotRepository
+import com.k60linbox.manager.data.copyFileTo
+import com.k60linbox.manager.data.copyUriTo
 import com.k60linbox.manager.data.describe
+import com.k60linbox.manager.data.uriDisplayName
 import com.k60linbox.manager.runtime.ContainerInfo
+import com.k60linbox.manager.runtime.FileEntry
 import com.k60linbox.manager.runtime.Linbox
 import com.k60linbox.manager.runtime.PortMapping
 import com.k60linbox.manager.runtime.SnapshotInfo
@@ -37,6 +41,10 @@ class ContainerDetailViewModel(app: Application, val containerName: String) : An
         val logs: List<String> = emptyList(),
         val autostart: Boolean = false,
         val message: String? = null,
+        /** 文件页：当前目录与它的内容。 */
+        val currentPath: String = "/",
+        val entries: List<FileEntry> = emptyList(),
+        val filesLoading: Boolean = false,
     )
 
     private val _state = MutableStateFlow(State())
@@ -168,4 +176,88 @@ class ContainerDetailViewModel(app: Application, val containerName: String) : An
     }
 
     fun consumeMessage() = _state.update { it.copy(message = null) }
+
+    // ------------------------------------------------------------ 文件页
+
+    fun openDir(path: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(filesLoading = true) }
+            val result = containers.ls(containerName, path)
+            _state.update {
+                it.copy(
+                    filesLoading = false,
+                    currentPath = result.getOrNull()?.path ?: path,
+                    entries = result.getOrNull()?.entries ?: it.entries,
+                    message = result.exceptionOrNull()?.let { e -> "读取目录失败：${e.describe()}" } ?: it.message,
+                )
+            }
+        }
+    }
+
+    /** 把 SAF 选中的文件复制进应用缓存，再让运行时推到容器里的 dir。 */
+    fun upload(dir: String, uri: Uri) {
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val context = getApplication<Application>()
+                    val name = uriDisplayName(context, uri)?.substringAfterLast('/') ?: "upload.bin"
+                    val temp = File(context.cacheDir, "linbox-upload-${System.currentTimeMillis()}-$name")
+                    copyUriTo(context, uri, temp)
+                    val target = joinPath(dir, name)
+                    containers.push(containerName, temp.absolutePath, target).getOrThrow()
+                    temp.delete()
+                    name
+                }
+            }
+            _state.update {
+                it.copy(
+                    busy = false,
+                    message = result.fold(
+                        { name -> "已上传到 $dir/$name" },
+                        { error -> "上传失败：${error.describe()}" },
+                    ),
+                )
+            }
+            openDir(dir)
+        }
+    }
+
+    /** 先从容器拉出到缓存，再写进用户选定的位置（避免让 shell 直接写 SAF）。 */
+    fun download(dir: String, entry: FileEntry, uri: Uri) {
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val context = getApplication<Application>()
+                    val temp = File(context.cacheDir, "linbox-download-${System.currentTimeMillis()}-${entry.name}")
+                    containers.pull(containerName, joinPath(dir, entry.name), temp.absolutePath).getOrThrow()
+                    copyFileTo(context, temp, uri)
+                    temp.delete()
+                    entry.name
+                }
+            }
+            _state.update {
+                it.copy(
+                    busy = false,
+                    message = result.fold(
+                        { name -> "已导出 $name" },
+                        { error -> "导出失败：${error.describe()}" },
+                    ),
+                )
+            }
+        }
+    }
+
+    fun parentOf(path: String): String {
+        if (path == "/" || path.isEmpty()) return "/"
+        val trimmed = path.trimEnd('/')
+        val cut = trimmed.substringBeforeLast('/', "")
+        return cut.ifEmpty { "/" }
+    }
+
+    companion object {
+        fun joinPath(dir: String, name: String): String =
+            if (dir.endsWith("/")) dir + name else "$dir/$name"
+    }
 }

@@ -4,6 +4,7 @@ package com.k60linbox.manager.data
 import com.k60linbox.manager.runtime.ActionInfo
 import com.k60linbox.manager.runtime.ContainerInfo
 import com.k60linbox.manager.runtime.ExecResult
+import com.k60linbox.manager.runtime.FileListing
 import com.k60linbox.manager.runtime.Linbox
 import com.k60linbox.manager.runtime.toResult
 import kotlinx.coroutines.Dispatchers
@@ -79,6 +80,19 @@ class ContainerRepository {
 
     suspend fun log(name: String, lines: Int = 200): Result<List<String>> = io {
         Linbox.call<List<String>>("log", name, "-n", lines.toString()).toResult()
+    }
+
+    /** 列目录；运行中与停止态都能用（停止态会临时挂载镜像）。 */
+    suspend fun ls(name: String, path: String): Result<FileListing> = io {
+        Linbox.call<FileListing>("ls", name, "--path", path).toResult()
+    }
+
+    suspend fun push(name: String, hostPath: String, containerPath: String): Result<ActionInfo> = io {
+        Linbox.call<ActionInfo>("push", name, hostPath, containerPath).toResult()
+    }
+
+    suspend fun pull(name: String, containerPath: String, hostPath: String): Result<ActionInfo> = io {
+        Linbox.call<ActionInfo>("pull", name, containerPath, hostPath).toResult()
     }
 
     private suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }

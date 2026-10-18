@@ -19,11 +19,12 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.k60linbox.manager.net.MirrorPresets
+import com.k60linbox.manager.runtime.FileEntry
 import com.k60linbox.manager.runtime.SnapshotInfo
 
-private val DETAIL_TABS = listOf("概览", "终端", "端口", "快照", "日志")
+private val DETAIL_TABS = listOf("概览", "终端", "文件", "端口", "快照", "日志")
 
-/** 单个容器的管理界面。文件页将在后续阶段加入。 */
+/** 单个容器的管理界面：概览 / 终端 / 文件 / 端口 / 快照 / 日志。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
@@ -38,12 +39,35 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
     var destroyAsk by remember { mutableStateOf(false) }
     var pendingExport by remember { mutableStateOf<SnapshotInfo?>(null) }
 
+    var pendingUploadDir by remember { mutableStateOf<String?>(null) }
+    var pendingDownload by remember { mutableStateOf<FileEntry?>(null) }
+
     val exporter = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri ->
         val target = pendingExport
         if (uri != null && target != null) vm.exportSnapshot(target, uri)
         pendingExport = null
+    }
+
+    val uploader = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val dir = pendingUploadDir
+        if (uri != null && dir != null) vm.upload(dir, uri)
+        pendingUploadDir = null
+    }
+
+    val downloader = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri ->
+        val entry = pendingDownload
+        val dir = state.currentPath
+        if (uri != null && entry != null) vm.download(dir, entry, uri)
+        pendingDownload = null
+    }
+
+    // 切到「文件」页时才去列目录：停止态的容器会临时挂载镜像，不该白挂。
+    LaunchedEffect(tab) {
+        if (tab == 2) vm.openDir(state.currentPath)
     }
 
     LaunchedEffect(state.message) {
@@ -74,8 +98,20 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
             when (tab) {
                 0 -> OverviewTab(state, vm, onDestroy = { destroyAsk = true })
                 1 -> TerminalTab(containerName = name, running = state.info?.running == true)
-                2 -> PortsTab(state, vm)
-                3 -> SnapshotsTab(
+                2 -> FilesTab(
+                    state = state,
+                    vm = vm,
+                    onUpload = { dir ->
+                        pendingUploadDir = dir
+                        uploader.launch(arrayOf("*/*"))
+                    },
+                    onDownload = { entry ->
+                        pendingDownload = entry
+                        downloader.launch(entry.name)
+                    },
+                )
+                3 -> PortsTab(state, vm)
+                4 -> SnapshotsTab(
                     state = state,
                     vm = vm,
                     onExport = { snapshot ->
@@ -209,6 +245,72 @@ private fun OverviewTab(
         if (output.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
             Text(output, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 文件
+
+@Composable
+private fun FilesTab(
+    state: ContainerDetailViewModel.State,
+    vm: ContainerDetailViewModel,
+    onUpload: (String) -> Unit,
+    onDownload: (FileEntry) -> Unit,
+) {
+    Column(Modifier.fillMaxSize()) {
+        Column(Modifier.padding(16.dp)) {
+            Text(state.currentPath, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    enabled = state.currentPath != "/",
+                    onClick = { vm.openDir(vm.parentOf(state.currentPath)) },
+                ) { Text("上级目录") }
+                OutlinedButton(onClick = { vm.openDir(state.currentPath) }) { Text("刷新") }
+                Button(onClick = { onUpload(state.currentPath) }) { Text("上传到此") }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "运行中和已停止的容器都能浏览（停止时会临时挂载镜像）。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        HorizontalDivider()
+
+        if (state.filesLoading) {
+            LoadingScreen()
+            return@Column
+        }
+        if (state.entries.isEmpty()) {
+            Text("（目录为空）", Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
+            return@Column
+        }
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(state.entries, key = { it.name }) { entry ->
+                Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                (if (entry.isDir) "[目录] " else "") + entry.name,
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                if (entry.isDir) entry.mode else "${humanBytes(entry.size)}  ${entry.mode}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        if (entry.isDir) {
+                            TextButton(onClick = {
+                                vm.openDir(ContainerDetailViewModel.joinPath(state.currentPath, entry.name))
+                            }) { Text("进入") }
+                        } else {
+                            TextButton(onClick = { onDownload(entry) }) { Text("导出") }
+                        }
+                    }
+                }
+            }
         }
     }
 }
