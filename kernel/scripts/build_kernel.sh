@@ -45,7 +45,10 @@ gzip -dc "$CONFIG_GZ" > "$KERNEL_SRC/.config"
     --enable LTO_CLANG_THIN
 
 # 2. 打开容器所需命名空间（本项目的核心补丁）。
-for opt in NAMESPACES PID_NS IPC_NS USER_NS NET_NS UTS_NS SYSVIPC CGROUPS CGROUP_PIDS; do
+#
+# 隔离测试：先只加 PID_NS（其余 NAMESPACES/NET_NS/UTS_NS/CGROUPS 原厂已 =y），
+# 用于判定究竟是哪一项导致补丁内核无法启动。确认后再逐步加回 IPC_NS/USER_NS 等。
+for opt in PID_NS; do
     "$KERNEL_SRC/scripts/config" --file "$KERNEL_SRC/.config" --enable "$opt"
 done
 
@@ -62,7 +65,7 @@ if [[ "$RELEASE" != "$TARGET_RELEASE" ]]; then
 fi
 
 # 3. 确认命名空间确实被打开（kconfig 依赖可能把某项又关掉）。
-for opt in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_CGROUP_PIDS; do
+for opt in CONFIG_PID_NS; do
     if ! grep -q "^$opt=y$" "$KERNEL_SRC/.config"; then
         echo "错误：$opt 未被启用（kconfig 依赖未满足）" >&2
         grep "^$opt" "$KERNEL_SRC/.config" >&2 || true

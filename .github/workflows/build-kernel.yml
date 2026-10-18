@@ -69,7 +69,7 @@ jobs:
           set -euxo pipefail
           file out/kernel/Image
           strings out/kernel/Image | grep -m 1 'Linux version 5.10.252-gki-g19f54b03cc87'
-          for opt in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_CGROUP_PIDS; do
+          for opt in CONFIG_PID_NS; do
             grep -q "^$opt=y$" out/kernel/kernel.config || \
               { echo "$opt 未启用" >&2; exit 1; }
           done
