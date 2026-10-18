@@ -912,7 +912,7 @@ cmd_status() {
     _st=stopped; _pid=""
     if _pid="$(running_pid "$_name" 2>/dev/null)"; then _st=running; else _pid=""; fi
     if [ "$J" = "1" ]; then
-        emit "{\"name\":\"$(json_escape "$_name")\",\"status\":\"$_st\",\"pid\":${_pid:-null},\"ip\":\"$(json_escape "$IP")\",\"host\":\"$(json_escape "$HOSTNAME")\"}"
+        emit "{\"name\":\"$(json_escape "$_name")\",\"status\":\"$_st\",\"pid\":${_pid:-null},\"ip\":\"$(json_escape "$IP")\",\"host\":\"$(json_escape "$HOSTNAME")\",\"memoryMB\":${MEMORY_MB:-null}}"
     else
         printf '%s: %s (ip=%s host=%s%s)\n' "$_name" "$_st" "$IP" "$HOSTNAME" \
             "$([ -n "$_pid" ] && printf ' pid=%s' "$_pid")"

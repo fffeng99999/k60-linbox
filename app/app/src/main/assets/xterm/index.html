@@ -1,7 +1,7 @@
 <!doctype html>
 <!--
   k60-linbox 内嵌终端：xterm.js（MIT）负责渲染，PTY 由设备端 `linbox attach`
-  （busybox script）提供。数据不经内存字符串，一律 base64 走 JS 桥。
+  （busybox script）提供。数据一律 base64 走 JS 桥，主机侧只在主线程碰 WebView。
 -->
 <html lang="zh-CN">
 <head>
@@ -10,8 +10,8 @@
   <link rel="stylesheet" href="xterm.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
-    #t { width: 100vw; height: 100vh; padding: 2px 0 0 2px; box-sizing: border-box; }
-    #hint { position: absolute; left: 8px; bottom: 6px; color: #888; font: 12px monospace; }
+    #t { width: 100%; height: 100%; padding: 2px 0 0 2px; box-sizing: border-box; }
+    #hint { position: absolute; left: 8px; bottom: 6px; color: #777; font: 12px monospace; }
   </style>
 </head>
 <body>
@@ -21,34 +21,28 @@
   <script>
   (function () {
     var FONT_SIZE = 14;
-    var ROWS_PER_CHAR = 1.2;   // 等宽字体的近似行高系数
-    var COLS_PER_CHAR = 0.6;   // 等宽字体的近似字符宽系数
+    var CHAR_H = Math.round(FONT_SIZE * 1.2);   // 等宽字体行高的近似值
+    var CHAR_W = Math.round(FONT_SIZE * 0.6);   // 等宽字体字符宽的近似值
+    var MAX_WAIT = 60;                          // 最多等 6 秒布局稳定
 
-    var term = new Terminal({
-      fontSize: FONT_SIZE,
-      cursorBlink: true,
-      scrollback: 2000,
-      theme: { background: '#000000', foreground: '#e6e6e6' }
-    });
-    term.open(document.getElementById('t'));
-    window.term = term;
-
+    var term = null;
+    var booted = false;
     var encoder = new TextEncoder();
 
-    function bytesToBase64(bytes) {
+    function log(msg) {
+      try { LinboxBridge.log(msg); } catch (e) { }
+    }
+
+    function toBase64(bytes) {
       var s = '';
       for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
       return btoa(s);
     }
 
-    // 键盘输入 -> Kotlin（base64 承载 UTF-8 字节，避免中文/转义字符被破坏）
-    term.onData(function (data) {
-      try { LinboxBridge.write(bytesToBase64(encoder.encode(data))); } catch (e) { }
-    });
-
     // Kotlin -> 终端：xterm 的 write 接受 Uint8Array，会自行做 UTF-8 解码，
-    // 因此跨 chunk 切断的多字节字符也能正确拼接。
+    // 所以跨 chunk 切断的多字节字符也能正确拼回来。
     window.linboxFeed = function (base64) {
+      if (!term) return;
       var bin = atob(base64);
       var bytes = new Uint8Array(bin.length);
       for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -56,28 +50,57 @@
     };
 
     window.linboxExit = function (code) {
-      term.write('\r\n\u001b[33m[会话已结束，退出码 ' + code + '] 点上方「刷新」可重开\u001b[0m\r\n');
+      if (!term) return;
+      term.write('\r\n\u001b[33m[会话已结束，退出码 ' + code + '] 点上方「重开会话」可重开\u001b[0m\r\n');
     };
 
-    // busybox script 不支持运行中改窗口大小，所以在会话开始前只算一次列行数。
-    function measure() {
-      var rect = document.getElementById('t').getBoundingClientRect();
-      var charW = Math.max(4, Math.round(FONT_SIZE * COLS_PER_CHAR));
-      var charH = Math.max(8, Math.round(FONT_SIZE * ROWS_PER_CHAR));
-      var cols = Math.max(20, Math.floor(rect.width / charW));
-      var rows = Math.max(5, Math.floor(rect.height / charH));
-      return [cols, rows];
+    function viewport() {
+      var el = document.getElementById('t');
+      var rect = el.getBoundingClientRect();
+      var w = rect.width > 0 ? rect.width : document.documentElement.clientWidth;
+      var h = rect.height > 0 ? rect.height : document.documentElement.clientHeight;
+      return [w, h];
     }
 
-    function boot() {
-      var size = measure();
-      document.getElementById('hint').textContent = size[0] + 'x' + size[1];
-      try { LinboxBridge.ready(size[0], size[1]); } catch (e) { }
+    // 关键：WebView 刚创建时布局还没稳定，这时候量出来会是「宽 428 高 85」这种离谱值
+    // （实测 xterm 只画 5 行且文字看不见）。所以要等到尺寸合理再开终端。
+    function boot(attempt) {
+      if (booted) return;
+      var size = viewport();
+      if ((size[0] < 100 || size[1] < 100) && attempt < MAX_WAIT) {
+        setTimeout(function () { boot(attempt + 1); }, 100);
+        return;
+      }
+      booted = true;
+
+      var el = document.getElementById('t');
+      term = new Terminal({
+        fontSize: FONT_SIZE,
+        cursorBlink: true,
+        scrollback: 2000,
+        theme: { background: '#000000', foreground: '#e6e6e6' }
+      });
+      term.open(el);
+      window.term = term;
+
+      // 键盘输入 -> Kotlin（base64 承载 UTF-8 字节，避免中文/转义字符被破坏）
+      term.onData(function (data) {
+        try { LinboxBridge.write(toBase64(encoder.encode(data))); } catch (e) { }
+      });
+
+      var cols = Math.max(20, Math.floor(size[0] / CHAR_W));
+      var rows = Math.max(5, Math.floor(size[1] / CHAR_H));
+      term.resize(cols, rows);
+      document.getElementById('hint').textContent = cols + 'x' + rows;
+      log('measure ' + cols + 'x' + rows + ' (attempt ' + attempt + ')');
+
+      // 行列数只报一次：busybox script 不支持会话中途 resize
+      try { LinboxBridge.ready(cols, rows); } catch (e) { }
       term.focus();
     }
 
-    if (document.readyState === 'complete') setTimeout(boot, 60);
-    else window.addEventListener('load', function () { setTimeout(boot, 60); });
+    if (document.readyState === 'complete') boot(0);
+    else window.addEventListener('load', function () { boot(0); });
   })();
   </script>
 </body>

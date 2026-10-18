@@ -27,8 +27,14 @@ class TerminalSession(private val containerName: String) {
     @Volatile
     private var closed = false
 
+    // 这三个回调由 JavaBridge 线程写、读线程读，加 @Volatile 保证可见性
+    @Volatile
     var onOutput: ((ByteArray) -> Unit)? = null
+
+    @Volatile
     var onExit: ((Int) -> Unit)? = null
+
+    @Volatile
     var onLog: ((String) -> Unit)? = null
 
     val running: Boolean get() = process?.isAlive == true
