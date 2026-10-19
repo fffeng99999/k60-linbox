@@ -26,7 +26,7 @@
 
 set -u
 
-LINBOX_VERSION="1.1.0"
+LINBOX_VERSION="1.1.1"
 LINBOX_PROTOCOL="1"
 
 LINBOX_DIR=${LINBOX_DIR:-/data/local/linbox}
@@ -1331,18 +1331,23 @@ cmd_destroy() {
 
 # 在容器里跑一条命令，使用发行版自己的 PATH/HOME/TERM 环境（宿主 Android 环境会让
 # ls/head 等去 /system/bin 找而报 command not found）。
+#
+# 这里只用 `nsenter -n` 进容器的网络命名空间，**不要**再套 `ip netns exec`：
+# 不同 su 调用（App 进程 / adb shell）可能拿到不同的 mount namespace，而
+# `ip netns add` 的 bind mount 只在创建它的那个 namespace 里可见；跨 namespace
+# 再 `ip netns exec` 会报 `setting the network namespace ... failed: Invalid argument`。
+# nsenter 直接按 PID 进 netns，不依赖 /mnt/run 下的 netns 文件。
 cont_do() {
     _name=$1; _pid=$2; _cmd=$3
-    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
     _root="/proc/$_pid/root"
     if [ -x "$_root/usr/bin/env" ]; then
-        ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+        nsenter -t "$_pid" -m -u -p -n -- \
             chroot "$_root" /usr/bin/env -i \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             HOME=/root TERM="${TERM:-xterm}" LANG=C.UTF-8 \
             /bin/sh -c "$_cmd"
     else
-        ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+        nsenter -t "$_pid" -m -u -p -n -- \
             chroot "$_root" /bin/sh -c "$_cmd"
     fi
 }
@@ -1365,19 +1370,18 @@ cmd_shell() {
     _name=${1:-}
     load_config "$_name"
     _pid="$(running_pid "$_name" 2>/dev/null)" || fail NOT_RUNNING "容器未运行: $_name"
-    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
     _root="/proc/$_pid/root"
     log "进入 $_name 的 shell（exit 退出）"
     if [ -x "$_root/usr/bin/env" ]; then
-        ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+        nsenter -t "$_pid" -m -u -p -n -- \
             chroot "$_root" /usr/bin/env -i \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             HOME=/root TERM="${TERM:-xterm}" LANG=C.UTF-8 \
             /bin/sh -i && return 0
     fi
-    ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+    nsenter -t "$_pid" -m -u -p -n -- \
         chroot "$_root" /bin/sh -i 2>/dev/null || \
-    ip netns exec "$_ns" nsenter -t "$_pid" -m -- \
+    nsenter -t "$_pid" -m -- \
         chroot "$_root" /bin/sh -i
 }
 
@@ -1397,7 +1401,6 @@ cmd_attach() {
     load_config "$_name"
     _pid="$(running_pid "$_name" 2>/dev/null)" || fail NOT_RUNNING "容器未运行: $_name"
     command -v busybox >/dev/null 2>&1 || fail TOOL_MISSING "缺少 busybox，无法提供 PTY"
-    _ns="$(cat "$(run_dir "$_name")/netns" 2>/dev/null || printf 'linbox-%s' "$_name")"
     _root="/proc/$_pid/root"
 
     _stty=""
@@ -1409,7 +1412,7 @@ cmd_attach() {
         _sc="chroot $_root /bin/sh -c '${_stty}exec /bin/sh -i'"
     fi
     log "接入 $_name 终端（Ctrl-D 退出）"
-    ip netns exec "$_ns" nsenter -t "$_pid" -m -u -p -n -- \
+    nsenter -t "$_pid" -m -u -p -n -- \
         busybox script -q -c "$_sc" /dev/null
 }
 
