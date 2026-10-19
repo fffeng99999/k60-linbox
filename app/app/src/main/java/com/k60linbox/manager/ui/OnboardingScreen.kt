@@ -182,8 +182,9 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                 3. 安装完成后重启设备
                 4. 回到本页点「重新检测」
 
-                模块会把 linbox 运行时与 resize2fs/e2fsck 放到
-                /data/adb/modules/k60_linbox/ 下。
+                模块提供 /system/bin/linbox 运行时。扩容还需要设备自带
+                e2fsck/resize2fs；若「能力自检」里显示缺失，扩容会报
+                TOOL_MISSING，此时请安装带 e2fsprogs 的 busybox 或改用 CLI 处理。
             """.trimIndent(),
             onDismiss = { help = null },
         )
@@ -194,13 +195,18 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                 要让容器拥有独立 PID 1，需要内核开启 PID 命名空间。
                 刷入步骤（请自行确认风险，应用不会写入任何分区）：
 
-                1. 从项目 GitHub Release 的 kernel-v* 资产下载 Image
-                2. 设备进入 fastboot，执行：
-                   fastboot flash boot_a Image
-                3. 重启后回来点「重新检测」
-                4. 需要回滚时：fastboot flash boot_a <你备份的原厂 boot 镜像>
+                1. 在 GitHub Actions 的 build-k60-linbox-kernel 运行里下载
+                   Image 与 System.map（该工作流只出 artifact，不发 Release）
+                2. 用仓库里的 kernel/scripts/repack_boot.py 把 Image 装回
+                   原厂 boot 镜像（不能把裸 Image 直接刷进 boot 分区）：
+                   python3 repack_boot.py --stock-boot boot_a.img \
+                     --kernel Image --output boot-linbox.img
+                3. 先临时验证：fastboot boot boot-linbox.img
+                4. 确认 /proc/self/ns 里出现 pid 后，再持久刷入：
+                   fastboot flash boot_a boot-linbox.img
+                5. 回滚：fastboot flash boot_a <你备份的原厂 boot 镜像>
 
-                提示：先备份原厂 boot，或在 Magisk 中保留一份可直接刷回的镜像。
+                提示：先备份原厂 boot；应用本身不会写入任何分区。
             """.trimIndent(),
             onDismiss = { help = null },
         )

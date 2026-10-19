@@ -82,8 +82,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         bases.import(archivePath, name)
     }
 
-    fun createContainer(name: String, base: String, size: String, memMb: Int, host: String?, init: String?) =
-        act("创建容器") { containers.create(name, base, size, memMb, host, init) }
+    fun createContainer(
+        name: String,
+        base: String,
+        size: String,
+        memMb: Int,
+        host: String?,
+        init: String?,
+        mirror: String? = null,
+    ) = act("创建容器") { containers.create(name, base, size, memMb, host, init, mirror) }
 
     /**
      * 下载某个发行版并导入为 base。断点续传由 Downloader 负责，

@@ -36,7 +36,8 @@ class SettingsStore(private val context: Context) {
     val monitorEnabled: Flow<Boolean> = context.settingsDataStore.data.map { it[Keys.monitorEnabled] ?: false }
     val defaultMemMb: Flow<Int> = context.settingsDataStore.data.map { it[Keys.defaultMemMb] ?: 2048 }
     val defaultSize: Flow<String> = context.settingsDataStore.data.map { it[Keys.defaultSize] ?: "4G" }
-    val defaultInit: Flow<String> = context.settingsDataStore.data.map { it[Keys.defaultInit] ?: "/sbin/init" }
+    // 空 = 自动：运行时优先 /sbin/init，其次 /init，都没有就生成最小 /init。
+    val defaultInit: Flow<String> = context.settingsDataStore.data.map { it[Keys.defaultInit] ?: "" }
 
     suspend fun snapshot(): Snapshot = Snapshot(
         onboarded = onboarded.first(),

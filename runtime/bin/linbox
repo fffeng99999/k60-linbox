@@ -26,7 +26,7 @@
 
 set -u
 
-LINBOX_VERSION="1.0.0"
+LINBOX_VERSION="1.1.0"
 LINBOX_PROTOCOL="1"
 
 LINBOX_DIR=${LINBOX_DIR:-/data/local/linbox}
@@ -219,16 +219,26 @@ kill_stragglers() {
         _rp="$(cat "$_pidf" 2>/dev/null || true)"
         [ -n "$_rp" ] && _nsref="$(readlink "/proc/$_rp/ns/mnt" 2>/dev/null || true)"
     fi
-    for _pd in /proc/[0-9]*; do
-        _p=${_pd#/proc/}
-        _r="$(readlink "$_pd/root" 2>/dev/null || true)"
-        case "$_r" in
-            "$_mnt"|"$_mnt"/*) kill -KILL "$_p" 2>/dev/null || true; continue ;;
-        esac
-        [ -n "$_nsref" ] || continue
-        _n="$(readlink "$_pd/ns/mnt" 2>/dev/null || true)"
-        [ "$_n" = "$_nsref" ] && kill -KILL "$_p" 2>/dev/null || true
+    # 设备上通常有 700+ 进程。逐个 fork `readlink` 实测要十几秒到两分钟，
+    # 会让 start/stop/destroy 看起来像卡死；这里改成一次 `ls -l` 批量取链接目标。
+    # ls -l 的字段：... 日期 时间 /proc/<pid>/root -> <target>（$8/$9/$10）。
+    for _p in $(ls -l /proc/[0-9]*/root 2>/dev/null | awk -v m="$_mnt" '
+        $9 == "->" {
+            t = $10
+            if (t == m || index(t, m "/") == 1) {
+                n = split($8, a, "/"); if (n >= 3) print a[3]
+            }
+        }'); do
+        [ "$_p" = "$$" ] && continue
+        kill -KILL "$_p" 2>/dev/null || true
     done
+    if [ -n "$_nsref" ]; then
+        for _p in $(ls -l /proc/[0-9]*/ns/mnt 2>/dev/null | awk -v ns="$_nsref" '
+            $9 == "->" && $10 == ns { n = split($8, a, "/"); if (n >= 3) print a[3] }'); do
+            [ "$_p" = "$$" ] && continue
+            kill -KILL "$_p" 2>/dev/null || true
+        done
+    fi
     return 0
 }
 
@@ -289,35 +299,102 @@ base_import() {
 
     _kind="$(archive_kind "$_archive")"
     log "导入 $_archive（格式 $_kind）-> $_dir"
-    mkdir -p "$_dir"
+    mkdir -p "$(dirname "$_dir")"
+
+    # 先解到同级临时目录，校验完整后再替换目标：坏归档不会破坏已有 base，
+    # 也不会把只解了一半的 rootfs 登记成「可用」。
+    _stage="${_dir}.linbox-new"
+    rm -rf "$_stage" 2>/dev/null || true
+    mkdir -p "$_stage" || fail EXTRACT_FAILED "无法创建临时目录: $_stage"
+    _pkg_count=0
+
+    # 关键：toybox tar 会跳过指向目标目录之外的绝对符号链接（Ubuntu base 里的
+    # /usr/bin/awk -> /etc/alternatives/awk 等），导入后 rootfs 是残缺的。
+    # 设备上的 busybox tar 实测能正确创建这些链接，因此优先用它。
+    _tar_kind="toybox"
+    if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx tar; then
+        _tar_kind="busybox"
+        _xt() { busybox tar "$@"; }
+    else
+        warn "设备缺少 busybox tar，回退 toybox tar：绝对符号链接会被跳过，base 可能不完整"
+        _xt() { tar "$@"; }
+    fi
 
     case "$_kind" in
-        gzip) tar -xzf "$_archive" -C "$_dir" 2>/dev/null || \
-                  tar -xzf "$_archive" -C "$_dir" --exclude=./dev --exclude=./proc --exclude=./sys ;;
-        xz)   if busboy_has unxz; then
-                  busybox unxz -c "$_archive" | tar -xf - -C "$_dir" 2>/dev/null || \
-                      fail EXTRACT_FAILED "xz 解包失败"
-              else
-                  fail TOOL_MISSING "设备缺少 busybox unxz，无法解 xz"
-              fi ;;
-        *)    tar -xf "$_archive" -C "$_dir" 2>/dev/null || \
-                  fail EXTRACT_FAILED "tar 解包失败" ;;
+        gzip)
+            if ! _xt -xzf "$_archive" -C "$_stage" 2>/dev/null; then
+                _xt -xzf "$_archive" -C "$_stage" \
+                    --exclude=./dev --exclude=./proc --exclude=./sys || \
+                    { rm -rf "$_stage"; fail EXTRACT_FAILED "gzip 归档解包失败（文件可能损坏）"; }
+            fi ;;
+        xz)
+            if [ "$_tar_kind" = "busybox" ]; then
+                _xt -xJf "$_archive" -C "$_stage" || \
+                    { rm -rf "$_stage"; fail EXTRACT_FAILED "xz 归档解包失败（文件可能损坏）"; }
+            elif busboy_has unxz; then
+                busybox unxz -c "$_archive" | tar -xf - -C "$_stage" || \
+                    { rm -rf "$_stage"; fail EXTRACT_FAILED "xz 归档解包失败（文件可能损坏）"; }
+            else
+                rm -rf "$_stage"
+                fail TOOL_MISSING "设备缺少 busybox unxz，无法解 xz"
+            fi ;;
+        *)
+            _xt -xf "$_archive" -C "$_stage" || \
+                { rm -rf "$_stage"; fail EXTRACT_FAILED "tar 解包失败（文件可能损坏）"; } ;;
     esac
 
     # /dev /proc /sys 由运行时在容器内重新挂载，这里清空并把目录补回来
     for _d in dev proc sys; do
-        rm -rf "$_dir/$_d" 2>/dev/null || true
-        mkdir -p "$_dir/$_d" 2>/dev/null || true
+        rm -rf "$_stage/$_d" 2>/dev/null || true
+        mkdir -p "$_stage/$_d" 2>/dev/null || true
     done
-    if [ ! -d "$_dir/usr" ] && [ ! -d "$_dir/bin" ]; then
-        fail EXTRACT_FAILED "解包结果不像 rootfs（缺少 /usr 与 /bin）"
+    if [ ! -d "$_stage/usr" ] && [ ! -d "$_stage/bin" ]; then
+        rm -rf "$_stage" 2>/dev/null || true
+        fail EXTRACT_INCOMPLETE "解包结果不像 rootfs（缺少 /usr 与 /bin），归档可能不完整"
     fi
+
+    # Ubuntu/Debian 的最小镜像必须自带 apt/dpkg；缺了就是下载/解包不完整。
+    # 这里直接拒绝登记，避免新建出来的容器「连 apt 都没有」。
+    _os_id=""
+    if [ -f "$_stage/etc/os-release" ]; then
+        _os_id="$(sed -n 's/^ID=//p' "$_stage/etc/os-release" 2>/dev/null | head -n1 | tr -d '"')"
+    fi
+    case "$_os_id" in
+        ubuntu|debian)
+            if [ ! -x "$_stage/usr/bin/apt-get" ] || [ ! -x "$_stage/usr/bin/dpkg" ]; then
+                rm -rf "$_stage" 2>/dev/null || true
+                fail EXTRACT_INCOMPLETE "归档不完整：缺少 apt-get/dpkg，请重新下载后再导入"
+            fi
+            _pkg_count="$(grep -c '^Package:' "$_stage/var/lib/dpkg/status" 2>/dev/null || true)"
+            case "$_pkg_count" in ''|*[!0-9]*) _pkg_count=0 ;; esac
+            if [ "$_pkg_count" -lt 10 ]; then
+                rm -rf "$_stage" 2>/dev/null || true
+                fail EXTRACT_INCOMPLETE "归档不完整：只有 $_pkg_count 个软件包（Ubuntu/Debian 最小镜像至少应有 10 个）"
+            fi ;;
+        *)
+            if [ ! -e "$_stage/bin/sh" ]; then
+                rm -rf "$_stage" 2>/dev/null || true
+                fail EXTRACT_INCOMPLETE "归档不完整：缺少 /bin/sh"
+            fi ;;
+    esac
+
+    # 校验通过后再替换目标，失败时保留旧 base。
+    _old="${_dir}.linbox-old"
+    rm -rf "$_old" 2>/dev/null || true
+    if [ -e "$_dir" ]; then
+        mv "$_dir" "$_old" || { rm -rf "$_stage"; fail EXTRACT_FAILED "无法替换已有目录: $_dir"; }
+    fi
+    if ! mv "$_stage" "$_dir"; then
+        [ -e "$_old" ] && mv "$_old" "$_dir" 2>/dev/null || true
+        fail EXTRACT_FAILED "无法写入目标目录: $_dir"
+    fi
+    rm -rf "$_old" 2>/dev/null || true
 
     mkdir -p "$BASE_DIR/$_name"
     printf '%s\n' "$_dir" > "$BASE_DIR/$_name/rootfs.path"
     chmod 0755 "$_dir" 2>/dev/null || true
     event base "import $_name"
-    log "base 就绪: $_name -> $_dir"
+    log "base 就绪: $_name -> $_dir（$_pkg_count 个软件包）"
     emit "{\"name\":\"$(json_escape "$_name")\",\"path\":\"$(json_escape "$_dir")\"}"
 }
 
@@ -337,6 +414,8 @@ base_list() {
     _arr=""
     for d in "$BASE_DIR"/*; do
         [ -d "$d" ] || continue
+        # 失败的导入会留下空目录；没有 rootfs.path 就不算已登记的 base。
+        [ -f "$d/rootfs.path" ] || continue
         _n="$(basename "$d")"
         _p="$(cat "$d/rootfs.path" 2>/dev/null || echo '?')"
         _refs="$(base_refs "$_n")"
@@ -399,6 +478,20 @@ size_to_bytes() {
 
 # awk 版数值比较（避开 32 位截断）：a < b 时返回 0
 num_lt() { awk -v a="$1" -v b="$2" 'BEGIN{ exit (a < b) ? 0 : 1 }'; }
+
+# MB -> 字节。必须用 awk：设备 sh 是 32 位，2048*1024*1024 会溢出成负数，
+# 写进 memory.max 会被内核拒绝（默认 2048MB 正好踩中 2^31）。
+mb_to_bytes() {
+    printf '%s' "$1" | awk '
+        { if ($0 !~ /^[0-9]+$/) { print 0; exit }
+          printf "%.0f\n", $0 * 1048576 }'
+}
+
+# 端口号合法性（1-65535）
+valid_port() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
 
 # 在宿主命名空间把容器镜像挂到 containers/<名>/mnt（停止态文件操作/换源/扩容前用）
 image_mount_host() {
@@ -501,6 +594,7 @@ snapshot_dir() { printf '%s' "$(cont_dir "$1")/snapshots"; }
 
 cmd_snapshot() {
     _name=${1:-}; _label=${2:-}
+    valid_name "$_label" || fail BAD_ARGS "快照标签只能包含字母、数字、下划线或短横线"
     load_config "$_name"
     running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再建快照"
     _sd="$(snapshot_dir "$_name")"
@@ -512,6 +606,7 @@ cmd_snapshot() {
 
 cmd_restore() {
     _name=${1:-}; _label=${2:-}
+    valid_name "$_label" || fail BAD_ARGS "快照标签只能包含字母、数字、下划线或短横线"
     load_config "$_name"
     running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再恢复"
     _sd="$(snapshot_dir "$_name")"
@@ -542,6 +637,7 @@ cmd_snapshot_list() {
 
 cmd_snapshot_rm() {
     _name=${1:-}; _label=${2:-}
+    valid_name "$_label" || fail BAD_ARGS "快照标签只能包含字母、数字、下划线或短横线"
     load_config "$_name"
     [ -f "$(snapshot_dir "$_name")/$_label.img" ] || fail NO_SNAPSHOT "快照不存在: $_label"
     rm -f "$(snapshot_dir "$_name")/$_label.img"
@@ -654,8 +750,17 @@ setup_cgroup() {
     _cg="/sys/fs/cgroup/linbox_$_name"
     [ -e /sys/fs/cgroup/cgroup.controllers ] || { printf '\n'; return 0; }
     mkdir -p "$_cg" 2>/dev/null || { warn "无法创建 cgroup，跳过内存限额"; printf '\n'; return 0; }
-    if [ -f "$_cg/memory.max" ] && [ -n "$_mem" ]; then
-        printf '%s\n' "$((_mem * 1024 * 1024))" > "$_cg/memory.max" 2>/dev/null || true
+    _bytes="$(mb_to_bytes "$_mem")"
+    case "$_bytes" in
+        ''|0|*[!0-9]*) warn "内存限额无效（${_mem}MB），跳过"; _bytes="" ;;
+    esac
+    if [ -f "$_cg/memory.max" ] && [ -n "$_bytes" ]; then
+        if printf '%s\n' "$_bytes" > "$_cg/memory.max" 2>/dev/null; then
+            _got="$(cat "$_cg/memory.max" 2>/dev/null || true)"
+            [ "$_got" = "$_bytes" ] || warn "内存限额未生效（期望 $_bytes，实际 ${_got:-?}）"
+        else
+            warn "写入 memory.max 失败（${_mem}MB / $_bytes 字节）"
+        fi
     fi
     printf '%s\n' "$_cg"
 }
@@ -719,6 +824,8 @@ port_add() {
         fail BAD_ARGS "用法: linbox port add <名> <tcp|udp> <宿主端口> <容器端口>"
     load_config "$_name"
     case "$_proto" in tcp|udp) ;; *) fail BAD_ARGS "协议只支持 tcp/udp" ;; esac
+    valid_port "$_hp" || fail BAD_ARGS "宿主端口需为 1-65535: $_hp"
+    valid_port "$_cp" || fail BAD_ARGS "容器端口需为 1-65535: $_cp"
     _pf="$(ports_file "$_name")"
     grep -qx "$_proto $_hp $_cp" "$_pf" 2>/dev/null && \
         fail PORT_EXISTS "该映射已存在: $_proto 宿主 $_hp -> 容器 $_cp"
@@ -734,6 +841,9 @@ port_del() {
     [ -n "$_name" ] && [ -n "$_hp" ] && [ -n "$_cp" ] || \
         fail BAD_ARGS "用法: linbox port del <名> <tcp|udp> <宿主端口> <容器端口>"
     load_config "$_name"
+    case "$_proto" in tcp|udp) ;; *) fail BAD_ARGS "协议只支持 tcp/udp" ;; esac
+    valid_port "$_hp" || fail BAD_ARGS "宿主端口需为 1-65535: $_hp"
+    valid_port "$_cp" || fail BAD_ARGS "容器端口需为 1-65535: $_cp"
     _pf="$(ports_file "$_name")"
     [ -f "$_pf" ] || fail NO_PORT "该容器没有端口映射"
     _tmp="$_pf.tmp"; : > "$_tmp"; _found=0
@@ -807,21 +917,49 @@ cmd_port() {
 
 # ---------------------------------------------------------------- 容器创建
 
+# 列出 base 里可直接执行的 init 候选（用于报错提示与自动选择）
+detect_init() {
+    _di_dir=$1
+    for _di_path in /sbin/init /init /usr/sbin/init; do
+        [ -x "$_di_dir$_di_path" ] && printf '%s ' "$_di_path"
+    done
+    printf '\n'
+}
+
+# 给没有发行版 init 的 rootfs 写一个最小 PID 1。
+# 它只挂基础文件系统并常驻，容器仍可通过 linbox exec/shell 使用，apt 等最小软件集保持原样。
+write_min_init() {
+    _wmi_root=$1
+    cat > "$_wmi_root/init" <<'LINBOX_MIN_INIT'
+#!/bin/sh
+# generated by k60-linbox: minimal init for a rootfs without a distro init
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t tmpfs tmpfs /run 2>/dev/null
+# 保持 PID 1 存活；容器通过 linbox exec / shell 进入。
+while :; do sleep 3600; done
+LINBOX_MIN_INIT
+    chmod 0755 "$_wmi_root/init"
+}
+
 cmd_create() {
     _name=${1:-}; shift || true
     valid_name "$_name" || fail BAD_NAME "非法容器名: $_name"
     [ -e "$(cont_dir "$_name")" ] && fail CONTAINER_EXISTS "容器已存在: $_name"
 
-    _base=""; _host="linbox-$_name"; _ip=""; _mem="2048"; _init="/sbin/init"; _size="4G"
+    # _init 为空 = 自动：优先 /sbin/init，其次 /init，都没有就生成最小 /init。
+    _base=""; _host="linbox-$_name"; _ip=""; _mem="2048"; _init=""; _size="4G"; _mirror=""
     while [ $# -gt 0 ]; do
         _k=$1; shift
         case "$_k" in
-            --base)  _base=${1:-}; [ $# -gt 0 ] && shift || true ;;
-            --host)  _host=${1:-}; [ $# -gt 0 ] && shift || true ;;
-            --ip)    _ip=${1:-};   [ $# -gt 0 ] && shift || true ;;
-            --mem)   _mem=${1:-};  [ $# -gt 0 ] && shift || true ;;
-            --init)  _init=${1:-}; [ $# -gt 0 ] && shift || true ;;
-            --size)  _size=${1:-}; [ $# -gt 0 ] && shift || true ;;
+            --base)   _base=${1:-};   [ $# -gt 0 ] && shift || true ;;
+            --host)   _host=${1:-};   [ $# -gt 0 ] && shift || true ;;
+            --ip)     _ip=${1:-};     [ $# -gt 0 ] && shift || true ;;
+            --mem)    _mem=${1:-};    [ $# -gt 0 ] && shift || true ;;
+            --init)   _init=${1:-};   [ $# -gt 0 ] && shift || true ;;
+            --size)   _size=${1:-};   [ $# -gt 0 ] && shift || true ;;
+            --mirror) _mirror=${1:-}; [ $# -gt 0 ] && shift || true ;;
             *) fail BAD_ARGS "未知参数: $_k" ;;
         esac
     done
@@ -831,6 +969,28 @@ cmd_create() {
     [ -n "$_base_dir" ] || fail NO_BASE "base 不存在: $_base"
     [ -d "$_base_dir" ] || fail NO_BASE "base 目录已失效: $_base_dir"
 
+    _mem_bytes="$(mb_to_bytes "$_mem")"
+    case "$_mem_bytes" in
+        ''|0|*[!0-9]*) fail BAD_ARGS "--mem 需为正整数（MB）: $_mem" ;;
+    esac
+    case "$(size_to_bytes "$_size")" in
+        ''|0|*[!0-9]*) fail BAD_ARGS "--size 需形如 4G / 512M / 1048576" ;;
+    esac
+    case "$_mirror" in
+        ''|tuna|aliyun|ustc|official) ;;
+        *) fail BAD_ARGS "--mirror 只支持 tuna/aliyun/ustc/official" ;;
+    esac
+
+    # 显式指定 init 时，先在 base 里确认存在且可执行，避免建出必然启动失败的容器。
+    if [ -n "$_init" ]; then
+        case "$_init" in
+            /*) ;;
+            *) fail BAD_ARGS "--init 需为容器内绝对路径（如 /sbin/init）" ;;
+        esac
+        [ -x "$_base_dir$_init" ] || \
+            fail INIT_NOT_FOUND "base $_base 里没有可执行的 $_init（检测到: $(detect_init "$_base_dir")）"
+    fi
+
     _cd="$(cont_dir "$_name")"
     mkdir -p "$_cd/snapshots" "$(run_dir "$_name")"
 
@@ -839,6 +999,30 @@ cmd_create() {
     # mke2fs 的 -d 直接把 base 目录内容灌入镜像。
     mke2fs -t ext4 -F -q -d "$_base_dir" "$_cd/disk.img" || \
         fail CREATE_FAILED "mke2fs 生成镜像失败（base 目录可能大于 $_size）"
+
+    # 镜像已生成：临时挂载它，自动选择/生成 init，并按设置应用 apt 源。
+    IMAGE=disk.img
+    image_mount_host "$_name"
+    if [ -z "$_init" ]; then
+        if [ -x "$_cd/$MNT_NAME/sbin/init" ]; then
+            _init=/sbin/init
+        elif [ -x "$_cd/$MNT_NAME/init" ]; then
+            _init=/init
+        else
+            if ! write_min_init "$_cd/$MNT_NAME"; then
+                image_umount_host "$_name"
+                fail CREATE_FAILED "写入最小 /init 失败"
+            fi
+            _init=/init
+            log "base 没有发行版 init，已生成最小 /init（容器可直接启动，仍可用 linbox exec）"
+        fi
+    fi
+    case "$_mirror" in
+        tuna|aliyun|ustc|official)
+            _mfiles="$(mirror_rewrite "$_cd/$MNT_NAME" "$_mirror")"
+            log "已把 apt 源设置为 $_mirror（$_mfiles 个文件）" ;;
+    esac
+    image_umount_host "$_name"
 
     [ -n "$_ip" ] || _ip="$(auto_ip)"
     save_config "$_cd/config" \
@@ -850,8 +1034,8 @@ cmd_create() {
         "IMAGE=disk.img" \
         "SIZE=$_size"
     event container "create $_name"
-    log "已创建容器 $_name (base=$_base host=$_host ip=$_ip mem=${_mem}MB size=$_size)"
-    emit "{\"name\":\"$(json_escape "$_name")\",\"base\":\"$(json_escape "$_base")\",\"host\":\"$(json_escape "$_host")\",\"ip\":\"$(json_escape "$_ip")\",\"memoryMB\":$_mem,\"size\":\"$(json_escape "$_size")\"}"
+    log "已创建容器 $_name (base=$_base host=$_host ip=$_ip mem=${_mem}MB size=$_size init=$_init)"
+    emit "{\"name\":\"$(json_escape "$_name")\",\"base\":\"$(json_escape "$_base")\",\"host\":\"$(json_escape "$_host")\",\"ip\":\"$(json_escape "$_ip")\",\"memoryMB\":$_mem,\"size\":\"$(json_escape "$_size")\",\"init\":\"$(json_escape "$_init")\",\"mirror\":\"$(json_escape "$_mirror")\"}"
 }
 
 # 从 172.30.0.10 起找一个没被占用的地址
@@ -1024,8 +1208,15 @@ cmd_start() {
     port_sync "$_name" >/dev/null 2>&1 || true
 
     sleep 1
-    running_pid "$_name" >/dev/null 2>&1 || \
-        warn "容器启动后立即退出，请检查 rootfs 的 $INIT 是否存在且可执行"
+    if ! running_pid "$_name" >/dev/null 2>&1; then
+        _erc="$(cat "$_rd/exit" 2>/dev/null || true)"
+        # 启动失败也要把这次建的 netns/cgroup/loop 收干净，否则下次启动先撞残骸。
+        kill_stragglers "$_name"
+        teardown_net "$_name" "$_idx"
+        teardown_cgroup "$_name"
+        detach_loops "$_name"
+        fail CONTAINER_EXITED "容器启动后立即退出（退出码 ${_erc:-?}）：rootfs 的 $INIT 不存在、不可执行，或 init 自身报错（linbox log $_name 可看输出）"
+    fi
     event container "start $_name"
     log "容器 $_name 已启动 (launch pid=$_launched, container pid=$_cpid)"
     emit "{\"name\":\"$(json_escape "$_name")\",\"pid\":$_cpid,\"ip\":\"$(json_escape "$IP")\",\"host\":\"$(json_escape "$HOSTNAME")\"}"
@@ -1224,11 +1415,23 @@ cmd_set() {
             --mem)
                 _v=${1:-}; [ $# -gt 0 ] && shift || true
                 [ -n "$_v" ] || fail BAD_ARGS "--mem 需要数值（MB）"
+                _bytes="$(mb_to_bytes "$_v")"
+                case "$_bytes" in
+                    ''|0|*[!0-9]*) fail BAD_ARGS "--mem 需为正整数（MB）: $_v" ;;
+                esac
                 save_config_replacing "$_cd/config" MEMORY_MB "$_v"
                 _cg="/sys/fs/cgroup/linbox_$_name"
                 if running_pid "$_name" >/dev/null 2>&1 && [ -f "$_cg/memory.max" ]; then
-                    printf '%s\n' "$((_v * 1024 * 1024))" > "$_cg/memory.max" 2>/dev/null || true
-                    log "内存限额已在线调整为 ${_v}MB"
+                    if printf '%s\n' "$_bytes" > "$_cg/memory.max" 2>/dev/null; then
+                        _got="$(cat "$_cg/memory.max" 2>/dev/null || true)"
+                        if [ "$_got" = "$_bytes" ]; then
+                            log "内存限额已在线调整为 ${_v}MB"
+                        else
+                            warn "内存限额未生效（期望 $_bytes，实际 ${_got:-?}）"
+                        fi
+                    else
+                        warn "写入 memory.max 失败（${_v}MB / $_bytes 字节）"
+                    fi
                 else
                     log "内存限额将在下次启动生效: ${_v}MB"
                 fi
@@ -1246,7 +1449,19 @@ cmd_set() {
             --init)
                 _v=${1:-}; [ $# -gt 0 ] && shift || true
                 [ -n "$_v" ] || fail BAD_ARGS "--init 需要路径"
+                case "$_v" in
+                    /*) ;;
+                    *) fail BAD_ARGS "--init 需为容器内绝对路径（如 /sbin/init）" ;;
+                esac
                 running_pid "$_name" >/dev/null 2>&1 && fail CONTAINER_RUNNING "请先停止容器再改 init"
+                # 停止态可以直接挂镜像校验，避免改成一个不存在的 init 后启动即退出。
+                image_mount_host "$_name"
+                if [ ! -x "$_cd/$MNT_NAME$_v" ]; then
+                    _cand="$(detect_init "$_cd/$MNT_NAME")"
+                    image_umount_host "$_name"
+                    fail INIT_NOT_FOUND "镜像里没有可执行的 $_v（检测到: $_cand）"
+                fi
+                image_umount_host "$_name"
                 save_config_replacing "$_cd/config" INIT "$_v"; _changed=1 ;;
             --autostart)
                 _v=${1:-}; [ $# -gt 0 ] && shift || true
@@ -1635,7 +1850,9 @@ k60-linbox - 最接近虚拟机的 Android 系统容器运行时
 
 引导   doctor | version | caps
 发行版 base add|import|list|remove
-容器   create <名> --base <名> [--size 4G] [--mem 2048] [--host 名] [--ip 地址] [--init 路径]
+容器   create <名> --base <名> [--size 4G] [--mem 2048] [--host 名] [--ip 地址]
+       [--init 路径]  （留空自动：/sbin/init → /init → 生成最小 /init）
+       [--mirror tuna|aliyun|ustc|official]（创建时直接换 apt 源）
        list | start <名> | stop <名> | restart <名> | status [名] | destroy <名>
        exec <名> -- <命令> | shell <名> | log <名> [-n 行] [-f] [--json]
        attach <名> [--cols 列] [--rows 行]

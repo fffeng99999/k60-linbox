@@ -28,10 +28,12 @@ class ContainerRepository {
         memMb: Int,
         host: String? = null,
         init: String? = null,
+        mirror: String? = null,
     ): Result<ActionInfo> = io {
         val args = mutableListOf("create", name, "--base", base, "--size", size, "--mem", memMb.toString())
         if (!host.isNullOrBlank()) args += listOf("--host", host)
         if (!init.isNullOrBlank()) args += listOf("--init", init)
+        if (!mirror.isNullOrBlank()) args += listOf("--mirror", mirror)
         Linbox.callList<ActionInfo>(args).toResult()
     }
 

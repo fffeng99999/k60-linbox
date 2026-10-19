@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -60,23 +61,27 @@ fun AppRoot() {
         return
     }
 
-    val nav = rememberNavController()
-    NavHost(
-        navController = nav,
-        startDestination = if (onboarded) Routes.MAIN else Routes.ONBOARDING,
-    ) {
-        composable(Routes.ONBOARDING) {
-            OnboardingScreen(onFinish = {})
-        }
-        composable(Routes.MAIN) {
-            MainScreen(onOpen = { name -> nav.navigate(Routes.detail(name)) })
-        }
-        composable(
-            route = Routes.DETAIL,
-            arguments = listOf(navArgument("name") { type = NavType.StringType }),
-        ) { entry ->
-            val name = entry.arguments?.getString("name").orEmpty()
-            ContainerDetailScreen(name = name, onBack = { nav.popBackStack() })
+    // onboarded 变化时用 key 重建 NavHost：首次引导完成、以及在设置里「重新运行引导」
+    // 都会立即切换，而不是依赖 startDestination 变化去改动已有回退栈。
+    key(onboarded) {
+        val nav = rememberNavController()
+        NavHost(
+            navController = nav,
+            startDestination = if (onboarded) Routes.MAIN else Routes.ONBOARDING,
+        ) {
+            composable(Routes.ONBOARDING) {
+                OnboardingScreen(onFinish = {})
+            }
+            composable(Routes.MAIN) {
+                MainScreen(onOpen = { name -> nav.navigate(Routes.detail(name)) })
+            }
+            composable(
+                route = Routes.DETAIL,
+                arguments = listOf(navArgument("name") { type = NavType.StringType }),
+            ) { entry ->
+                val name = entry.arguments?.getString("name").orEmpty()
+                ContainerDetailScreen(name = name, onBack = { nav.popBackStack() })
+            }
         }
     }
 }

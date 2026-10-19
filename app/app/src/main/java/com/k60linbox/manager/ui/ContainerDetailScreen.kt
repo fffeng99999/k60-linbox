@@ -129,7 +129,7 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
             title = "销毁容器 $name",
             body = "将停止容器并删除它的磁盘镜像与快照，无法恢复。",
             confirmText = "销毁",
-            onConfirm = { vm.destroy(); destroyAsk = false },
+            onConfirm = { vm.destroy { onBack() }; destroyAsk = false },
             onDismiss = { destroyAsk = false },
         )
     }
@@ -180,8 +180,8 @@ private fun OverviewTab(
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = memText.toIntOrNull() != null,
-                onClick = { memText.toIntOrNull()?.let { vm.setMemory(it) } },
+                enabled = memText.toIntOrNull()?.let { it in 1..1048576 } == true,
+                onClick = { memText.toIntOrNull()?.takeIf { it in 1..1048576 }?.let { vm.setMemory(it) } },
             ) { Text("应用") }
         }
 
@@ -196,7 +196,7 @@ private fun OverviewTab(
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = sizeText.isNotBlank() && info?.running != true,
+                enabled = sizeText.trim().matches(Regex("^[0-9]+[KkMmGgTt]?$")) && info?.running != true,
                 onClick = { vm.resize(sizeText.trim()) },
             ) { Text("扩容") }
         }
@@ -322,6 +322,10 @@ private fun PortsTab(state: ContainerDetailViewModel.State, vm: ContainerDetailV
     var proto by remember { mutableStateOf("tcp") }
     var hostPort by remember { mutableStateOf("8022") }
     var containerPort by remember { mutableStateOf("22") }
+    val hostPortValue = hostPort.toIntOrNull()
+    val containerPortValue = containerPort.toIntOrNull()
+    val portValid = hostPortValue != null && hostPortValue in 1..65535 &&
+        containerPortValue != null && containerPortValue in 1..65535
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(16.dp)) {
@@ -350,9 +354,11 @@ private fun PortsTab(state: ContainerDetailViewModel.State, vm: ContainerDetailV
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    enabled = hostPort.toIntOrNull() != null && containerPort.toIntOrNull() != null,
+                    enabled = portValid,
                     onClick = {
-                        vm.addPort(proto, hostPort.toIntOrNull() ?: 0, containerPort.toIntOrNull() ?: 0)
+                        if (hostPortValue != null && containerPortValue != null) {
+                            vm.addPort(proto, hostPortValue, containerPortValue)
+                        }
                     },
                 ) { Text("添加") }
                 OutlinedButton(onClick = { vm.syncPorts() }) { Text("重放全部") }
@@ -412,7 +418,7 @@ private fun SnapshotsTab(
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(
-                    enabled = label.isNotBlank() && state.info?.running != true,
+                    enabled = label.trim().matches(Regex("^[A-Za-z0-9_-]+$")) && state.info?.running != true,
                     onClick = { vm.createSnapshot(label.trim()) },
                 ) { Text("建快照") }
             }
