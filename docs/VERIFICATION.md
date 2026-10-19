@@ -467,6 +467,70 @@ $ awk -v a=$A -v b=$B 'BEGIN{print (a<b)}'  → 0          （awk 双精度，�
 悄悄覆盖——这次就把 `_want` 覆盖成 `--dry-run`，错误信息里出现「请求 --dry-run 字节」。
 新增变量名要避开 `_want`（已改名 `_want_bytes`）。
 
+## 18. 2026-10-19 修复复验（运行时 1.1.0 / 模块 0.1.5 / App 0.3.0）
+
+### 18.1 默认 2048MB 内存限额被 32 位算术吞掉
+
+`setup_cgroup` 原先写 `$((_mem * 1024 * 1024))`；设备 sh 是 32 位，2048MB = 2^31
+溢出成 `-2147483648`，写 `memory.max` 被拒且被 `|| true` 吞掉：
+
+```text
+修复前：MEMORY_MB=2048 → /sys/fs/cgroup/linbox_ubuntu24/memory.max = max
+         MEMORY_MB=1024 → 1073741824（正常）
+修复后：MEMORY_MB=2048 → 2147483648；set --mem 4096 → 4294967296
+```
+
+修法：新增 `mb_to_bytes()`（awk，双精度），`setup_cgroup` 与 `cmd_set --mem` 共用，
+写入后读回校验。
+
+### 18.2 toybox tar 会跳过绝对符号链接（base 残缺的真正原因）
+
+同一份 Ubuntu 24.04 base 归档，toybox tar 解包会拒绝创建
+`usr/bin/awk -> /etc/alternatives/awk`、`etc/alternatives/awk -> /usr/bin/mawk`
+这类绝对链接，导入后的 base 里这两个文件**直接不存在**；busybox tar 解包则完整，
+零错误。运行时现在优先 `busybox tar`（gzip/xz/tar 都走它），并在登记前校验
+Ubuntu/Debian 的 `apt-get`/`dpkg` 与软件包数量（≥10）。
+
+设备复验（24.04.4 base，91 个包）：
+
+```text
+/usr/bin/awk -> /etc/alternatives/awk     ✔
+awk --version                              mawk 1.3.4 20240123
+apt-get --version                          apt 2.8.3 (arm64)
+```
+
+### 18.3 普通 Ubuntu base 没有 init，容器启动即退出
+
+Ubuntu base tarball 不带 `/sbin/init`（也没装 systemd）。`create` 现在自动选择：
+`/sbin/init` → `/init` → 生成最小 `/init`（挂 proc/sys/run 后常驻，仍可 `exec`）。
+显式传不存在的 `--init` 直接报 `INIT_NOT_FOUND`，并在 `base` 里先校验。
+
+```text
+create（不传 --init）→ INIT=/init，start rc=0
+exec apt-get --version → apt 2.8.3
+start（INIT=/nope）   → rc=1，错误 CONTAINER_EXITED(127)
+                        且 netns=0 / cgroup=0 / loop=0（已清理）
+```
+
+### 18.4 `kill_stragglers` 从「两分钟」降到秒级
+
+设备上约 777 个进程，旧实现逐个 fork `readlink /proc/<pid>/root`，`start`/`stop`
+实测要 1-2 分钟，看起来像卡死。改为一次 `ls -l /proc/[0-9]*/root`（和 `/ns/mnt`）
+批量取目标，再只对命中项 `kill`：
+
+```text
+修复前：start ≈ 2 分钟（777 次 fork）
+修复后：start 4.06s，stop 4.00s
+```
+
+### 18.5 其他已复验项
+
+- 损坏归档（截断 gzip）：`EXTRACT_FAILED`，不登记 base、不留半截 rootfs；
+- `resize 2G→3G`：rc=0，镜像与配置同步为 3G；
+- `snapshot ../evil`：`BAD_ARGS`（快照标签只允许字母数字/下划线/短横线）；
+- `port add tcp 70000 22`：`BAD_ARGS`（端口 1-65535）；
+- `create --mirror aliyun`：镜像内 `ubuntu.sources` 已是 aliyun，`apt-get` 可用。
+
 
 
 

@@ -34,6 +34,8 @@ su -c 'linbox start demo'
                                         ├─ mount proc/sys/devtmpfs/devpts（本命名空间内）
                                         ├─ hostname <配置主机名>
                                         └─ exec chroot <mnt> <INIT>   ← 发行版 init
+                                             （INIT 自动选择：/sbin/init → /init
+                                               → 生成最小 /init）
 ```
 
 关键点：
@@ -84,3 +86,7 @@ su -c 'linbox start demo'
 - rootfs 在线引导（debootstrap/pacstrap）未内建，采用「自带 rootfs」模型。
 - 图形输出（X11/Wayland）需配合 Termux:X11 或 VNC，不在运行时内。
 - 镜像大小固定在创建时；可在停止后用 `resize2fs` 扩容（设备有 e2fsprogs）。
+- 普通发行版 rootfs 归档通常不带 init（Ubuntu base 就没有 systemd）；`create` 在镜像里
+  自动补一个最小 `/init`，只挂基础文件系统并常驻，保证 minimal 镜像也能启动和 `exec`。
+- 导入归档用 busybox tar（toybox tar 会跳过绝对符号链接），并在登记前校验
+  Ubuntu/Debian 的 `apt-get`/`dpkg` 与软件包数量，残缺归档直接拒绝。

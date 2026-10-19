@@ -86,7 +86,10 @@ class ContainerDetailViewModel(app: Application, val containerName: String) : An
     fun start() = act("启动") { containers.start(containerName) }
     fun stop() = act("停止") { containers.stop(containerName) }
     fun restart() = act("重启") { containers.restart(containerName) }
-    fun destroy() = act("销毁") { containers.destroy(containerName) }
+    /** 销毁成功后回调（用于从详情页退回列表，避免停留在一个已不存在的容器上）。 */
+    fun destroy(onDone: () -> Unit = {}) = act("销毁") {
+        containers.destroy(containerName).onSuccess { onDone() }
+    }
     fun setMemory(mb: Int) = act("内存限额") { containers.setMemory(containerName, mb) }
     fun setAutostart(on: Boolean) = act("开机自启") { containers.setAutostart(containerName, on) }
     fun resize(size: String) = act("扩容") { containers.resize(containerName, size) }

@@ -8,6 +8,7 @@ import com.k60linbox.manager.runtime.Linbox
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 
 /** Magisk 模块的查找、下载与安装。 */
 class ModuleRepository(private val context: Context) {
@@ -20,7 +21,13 @@ class ModuleRepository(private val context: Context) {
     private val releases = GitHubReleaseClient()
     private val downloader = Downloader()
 
-    data class ModuleRelease(val tag: String, val url: String, val size: Long)
+    data class ModuleRelease(
+        val tag: String,
+        val url: String,
+        val size: Long,
+        /** Release 里的 SHA256SUMS 资产地址；用于下载后校验模块 zip。 */
+        val sumsUrl: String?,
+    )
 
     /** 结果：zip 落在本地，以及是否已经由 Magisk CLI 直接装好。 */
     data class InstallResult(val tag: String, val zipPath: String, val installedByCli: Boolean)
@@ -29,7 +36,7 @@ class ModuleRepository(private val context: Context) {
         releases.latestWithAsset(REPO, MODULE_ASSET).mapCatching { release ->
             val asset = release.asset(MODULE_ASSET)
                 ?: throw IllegalStateException("该 Release 里没有 $MODULE_ASSET")
-            ModuleRelease(release.tag, asset.url, asset.size)
+            ModuleRelease(release.tag, asset.url, asset.size, release.asset("SHA256SUMS")?.url)
         }
     }
 
@@ -40,6 +47,13 @@ class ModuleRepository(private val context: Context) {
                 val release = latest().getOrThrow()
                 val target = File(context.cacheDir, MODULE_ASSET)
                 downloader.download(release.url, target, onProgress).getOrThrow()
+                val sumsUrl = release.sumsUrl
+                    ?: throw IOException("该 Release 缺少 SHA256SUMS，拒绝安装未校验的模块")
+                val verify = downloader.verify(sumsUrl, "SHA-256", MODULE_ASSET, target)
+                if (verify.isFailure) {
+                    runCatching { target.delete() }
+                    throw IOException("模块校验失败：${verify.exceptionOrNull()?.message ?: "未知原因"}")
+                }
                 InstallResult(release.tag, target.absolutePath, installFrom(target))
             }
         }

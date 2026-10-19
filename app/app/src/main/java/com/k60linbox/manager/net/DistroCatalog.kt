@@ -66,25 +66,47 @@ object DistroCatalog {
 
     fun hasDomesticMirror(distro: Distro): Boolean = distro.family == "ubuntu"
 
-    /** 解析出真实下载地址；失败时给出可操作的原因。 */
+    /**
+     * 解析出真实下载地址；失败时给出可操作的原因。
+     *
+     * 国内镜像不一定同步新版本（实测 aliyun 的 26.04 目录会返回 200 的公告页），
+     * 所以镜像解析失败时自动回退官方源，而不是让用户只看到“找不到归档”。
+     */
     suspend fun resolve(distro: Distro, mirrorId: String): Result<Resolved> = runCatching {
         if (distro.family == "ubuntu") {
-            val dir = "${ubuntuPrefix(mirrorId)}/ubuntu-base/releases/${distro.urlSegment}/release/"
-            val html = fetchText(dir)
-            val pattern = Regex("ubuntu-base-([0-9]+(?:\\.[0-9]+)+)-base-arm64\\.tar\\.gz")
-            val best = pattern.findAll(html)
-                .map { it.groupValues[1] to it.value }
-                .maxWithOrNull { a, b -> compareVersions(a.first, b.first) }
-                ?: throw IOException("没有在 $dir 找到 arm64 base 归档")
-            Resolved(dir + best.second, best.second, dir + "SHA256SUMS", "SHA-256")
+            val bases = listOf(ubuntuPrefix(mirrorId), UBUNTU_OFFICIAL).distinct()
+            var last: Throwable? = null
+            for (base in bases) {
+                try {
+                    return@runCatching resolveUbuntu(distro, base)
+                } catch (t: Throwable) {
+                    last = t
+                }
+            }
+            throw last ?: IOException("没有可用的 Ubuntu 下载源")
         } else {
-            val dir = "${debianBase()}/images/cloud/${distro.urlSegment}/latest/"
-            val html = fetchText(dir)
-            val found = Regex("debian-${distro.major}-genericcloud-arm64\\.tar\\.xz")
-                .find(html)?.value
-                ?: throw IOException("没有在 $dir 找到 arm64 cloud 归档")
-            Resolved(dir + found, found, dir + "SHA512SUMS", "SHA-512")
+            resolveDebian(distro)
         }
+    }
+
+    private suspend fun resolveUbuntu(distro: Distro, base: String): Resolved {
+        val dir = "$base/ubuntu-base/releases/${distro.urlSegment}/release/"
+        val html = fetchText(dir)
+        val pattern = Regex("ubuntu-base-([0-9]+(?:\\.[0-9]+)+)-base-arm64\\.tar\\.gz")
+        val best = pattern.findAll(html)
+            .map { it.groupValues[1] to it.value }
+            .maxWithOrNull { a, b -> compareVersions(a.first, b.first) }
+            ?: throw IOException("没有在 $dir 找到 arm64 base 归档")
+        return Resolved(dir + best.second, best.second, dir + "SHA256SUMS", "SHA-256")
+    }
+
+    private suspend fun resolveDebian(distro: Distro): Resolved {
+        val dir = "${debianBase()}/images/cloud/${distro.urlSegment}/latest/"
+        val html = fetchText(dir)
+        val found = Regex("debian-${distro.major}-genericcloud-arm64\\.tar\\.xz")
+            .find(html)?.value
+            ?: throw IOException("没有在 $dir 找到 arm64 cloud 归档")
+        return Resolved(dir + found, found, dir + "SHA512SUMS", "SHA-512")
     }
 
     private fun versionKey(version: String): List<Int> =

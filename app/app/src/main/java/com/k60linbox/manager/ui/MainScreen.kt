@@ -24,7 +24,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
@@ -54,6 +57,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.k60linbox.manager.data.copyUriTo
@@ -77,6 +82,8 @@ fun MainScreen(onOpen: (String) -> Unit) {
     val app = context.applicationContext as Application
     val vm: MainViewModel = viewModel(factory = SimpleFactory { MainViewModel(app) })
     val state by vm.state.collectAsStateWithLifecycle()
+    // 从详情页返回时 MainScreen 会重新 resume；这里刷新一次，避免销毁容器后列表还显示旧项。
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refresh() }
     val snackbar = remember { SnackbarHostState() }
     var tab by remember { mutableIntStateOf(0) }
     var createOpen by remember { mutableStateOf(false) }
@@ -147,10 +154,10 @@ fun MainScreen(onOpen: (String) -> Unit) {
             bases = state.bases.map { it.name },
             defaultSize = state.prefs?.defaultSize ?: "4G",
             defaultMem = state.prefs?.defaultMemMb ?: 2048,
-            defaultInit = state.prefs?.defaultInit ?: "/sbin/init",
+            defaultInit = state.prefs?.defaultInit ?: "",
             onDismiss = { createOpen = false },
             onCreate = { name, base, size, mem, host, init ->
-                vm.createContainer(name, base, size, mem, host, init)
+                vm.createContainer(name, base, size, mem, host, init, state.prefs?.aptMirror)
                 createOpen = false
             },
         )
@@ -221,6 +228,7 @@ private fun ContainerCard(container: ContainerInfo, onOpen: (String) -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CreateDialog(
     bases: List<String>,
@@ -232,10 +240,18 @@ private fun CreateDialog(
 ) {
     var name by remember { mutableStateOf("") }
     var base by remember(bases) { mutableStateOf(bases.firstOrNull().orEmpty()) }
+    var baseExpanded by remember { mutableStateOf(false) }
     var size by remember { mutableStateOf(defaultSize) }
     var mem by remember { mutableStateOf(defaultMem.toString()) }
     var host by remember { mutableStateOf("") }
     var init by remember { mutableStateOf(defaultInit) }
+
+    val memValue = mem.trim().toIntOrNull()
+    val valid = name.trim().matches(Regex("^[A-Za-z0-9_-]+$")) &&
+        base.isNotBlank() &&
+        size.trim().matches(Regex("^[1-9][0-9]*[KkMmGgTt]?$")) &&
+        memValue != null && memValue in 1..1048576 &&
+        (init.isBlank() || init.trim().startsWith("/"))
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -249,23 +265,48 @@ private fun CreateDialog(
                     singleLine = true,
                 )
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = base,
-                    onValueChange = { base = it },
-                    label = { Text("发行版（base 名）") },
-                    supportingText = {
-                        Text(
-                            if (bases.isEmpty()) "还没有已导入的发行版，请先到「发行版」页导入"
-                            else "可用：${bases.joinToString(", ")}",
-                        )
-                    },
-                    singleLine = true,
-                )
+                ExposedDropdownMenuBox(
+                    expanded = baseExpanded,
+                    onExpandedChange = { if (bases.isNotEmpty()) baseExpanded = !baseExpanded },
+                ) {
+                    OutlinedTextField(
+                        value = base,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("发行版（base 名）") },
+                        supportingText = {
+                            Text(
+                                if (bases.isEmpty()) "还没有已导入的发行版，请先到「发行版」页导入"
+                                else "点按选择已导入的发行版",
+                            )
+                        },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = baseExpanded)
+                        },
+                        modifier = Modifier.menuAnchor().fillMaxWidth(),
+                        singleLine = true,
+                    )
+                    ExposedDropdownMenu(
+                        expanded = baseExpanded,
+                        onDismissRequest = { baseExpanded = false },
+                    ) {
+                        bases.forEach { candidate ->
+                            DropdownMenuItem(
+                                text = { Text(candidate) },
+                                onClick = {
+                                    base = candidate
+                                    baseExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = size,
                     onValueChange = { size = it },
                     label = { Text("磁盘镜像大小（如 4G）") },
+                    supportingText = { Text("格式：数字 + K/M/G，例如 4G") },
                     singleLine = true,
                 )
                 Spacer(Modifier.height(8.dp))
@@ -273,6 +314,7 @@ private fun CreateDialog(
                     value = mem,
                     onValueChange = { mem = it },
                     label = { Text("内存上限（MB）") },
+                    supportingText = { Text("1-1048576；运行时会真正写入 memory.max") },
                     singleLine = true,
                 )
                 Spacer(Modifier.height(8.dp))
@@ -286,20 +328,23 @@ private fun CreateDialog(
                 OutlinedTextField(
                     value = init,
                     onValueChange = { init = it },
-                    label = { Text("容器内 init 路径") },
+                    label = { Text("容器内 init 路径（留空自动）") },
+                    supportingText = {
+                        Text("留空：优先 /sbin/init，其次 /init；都没有时运行时生成最小 /init，不装 systemd 也能启动")
+                    },
                     singleLine = true,
                 )
             }
         },
         confirmButton = {
             TextButton(
-                enabled = name.isNotBlank() && base.isNotBlank(),
+                enabled = valid,
                 onClick = {
                     onCreate(
                         name.trim(),
                         base.trim(),
                         size.trim(),
-                        mem.trim().toIntOrNull() ?: defaultMem,
+                        memValue ?: defaultMem,
                         host.trim().ifBlank { null },
                         init.trim().ifBlank { null },
                     )
@@ -472,6 +517,7 @@ private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
     }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
         Text("下载发行版用的镜像站", style = MaterialTheme.typography.titleSmall)
+        Text("镜像站缺该版本时自动回退官方源", style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(4.dp))
         MirrorPresets.all.forEach { preset ->
             ChoiceRow(
@@ -483,6 +529,7 @@ private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
 
         Spacer(Modifier.height(16.dp))
         Text("容器内默认换源（apt）", style = MaterialTheme.typography.titleSmall)
+        Text("新建容器时自动应用；已存在的容器可在详情页单独换源", style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(4.dp))
         MirrorPresets.all.forEach { preset ->
             ChoiceRow(
@@ -518,8 +565,8 @@ private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = mem.toIntOrNull() != null,
-                onClick = { mem.toIntOrNull()?.let { vm.setDefaultMem(it) } },
+                enabled = mem.toIntOrNull()?.let { it in 1..1048576 } == true,
+                onClick = { mem.toIntOrNull()?.takeIf { it in 1..1048576 }?.let { vm.setDefaultMem(it) } },
             ) { Text("保存") }
         }
 
@@ -533,22 +580,22 @@ private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = size.isNotBlank(),
+                enabled = size.trim().matches(Regex("^[1-9][0-9]*[KkMmGgTt]?$")),
                 onClick = { vm.setDefaultSize(size.trim()) },
             ) { Text("保存") }
         }
 
-        var init by remember(prefs?.defaultInit) { mutableStateOf(prefs?.defaultInit ?: "/sbin/init") }
+        var init by remember(prefs?.defaultInit) { mutableStateOf(prefs?.defaultInit ?: "") }
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = init,
                 onValueChange = { init = it },
-                label = { Text("init 路径") },
+                label = { Text("init 路径（留空自动）") },
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = init.isNotBlank(),
+                enabled = init.isBlank() || init.trim().startsWith("/"),
                 onClick = { vm.setDefaultInit(init.trim()) },
             ) { Text("保存") }
         }

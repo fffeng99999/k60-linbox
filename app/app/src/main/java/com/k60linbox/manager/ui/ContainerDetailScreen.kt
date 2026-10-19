@@ -65,9 +65,10 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
         pendingDownload = null
     }
 
-    // 切到「文件」页时才去列目录：停止态的容器会临时挂载镜像，不该白挂。
+    // 「文件」页才去列目录（停止态会临时挂载镜像，不该白挂）；「日志」页自动拉一次。
     LaunchedEffect(tab) {
         if (tab == 2) vm.openDir(state.currentPath)
+        if (tab == 5) vm.loadLogs()
     }
 
     LaunchedEffect(state.message) {
@@ -129,7 +130,7 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
             title = "销毁容器 $name",
             body = "将停止容器并删除它的磁盘镜像与快照，无法恢复。",
             confirmText = "销毁",
-            onConfirm = { vm.destroy(); destroyAsk = false },
+            onConfirm = { vm.destroy { onBack() }; destroyAsk = false },
             onDismiss = { destroyAsk = false },
         )
     }
@@ -180,23 +181,23 @@ private fun OverviewTab(
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = memText.toIntOrNull() != null,
-                onClick = { memText.toIntOrNull()?.let { vm.setMemory(it) } },
+                enabled = memText.toIntOrNull()?.let { it in 1..1048576 } == true,
+                onClick = { memText.toIntOrNull()?.takeIf { it in 1..1048576 }?.let { vm.setMemory(it) } },
             ) { Text("应用") }
         }
 
         Spacer(Modifier.height(12.dp))
-        var sizeText by remember { mutableStateOf("8G") }
+        var sizeText by remember(info?.size) { mutableStateOf(info?.size ?: "8G") }
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = sizeText,
                 onValueChange = { sizeText = it },
-                label = { Text("磁盘容量（停止态扩容）") },
+                label = { Text("磁盘容量（当前 ${info?.size ?: "?"}，只能扩容）") },
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = sizeText.isNotBlank() && info?.running != true,
+                enabled = sizeText.trim().matches(Regex("^[1-9][0-9]*[KkMmGgTt]?$")) && info?.running != true,
                 onClick = { vm.resize(sizeText.trim()) },
             ) { Text("扩容") }
         }
@@ -207,8 +208,15 @@ private fun OverviewTab(
         Spacer(Modifier.height(16.dp))
         Text("容器内 apt 换源", style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(6.dp))
+        // 四个按钮放一行会溢出（官方源被挤出屏幕），拆成两行。
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            MirrorPresets.all.forEach { preset ->
+            MirrorPresets.all.take(3).forEach { preset ->
+                OutlinedButton(onClick = { vm.applyMirrorAndVerify(preset.id) }) { Text(preset.label) }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MirrorPresets.all.drop(3).forEach { preset ->
                 OutlinedButton(onClick = { vm.applyMirrorAndVerify(preset.id) }) { Text(preset.label) }
             }
         }
@@ -322,6 +330,10 @@ private fun PortsTab(state: ContainerDetailViewModel.State, vm: ContainerDetailV
     var proto by remember { mutableStateOf("tcp") }
     var hostPort by remember { mutableStateOf("8022") }
     var containerPort by remember { mutableStateOf("22") }
+    val hostPortValue = hostPort.toIntOrNull()
+    val containerPortValue = containerPort.toIntOrNull()
+    val portValid = hostPortValue != null && hostPortValue in 1..65535 &&
+        containerPortValue != null && containerPortValue in 1..65535
 
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(16.dp)) {
@@ -350,9 +362,11 @@ private fun PortsTab(state: ContainerDetailViewModel.State, vm: ContainerDetailV
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    enabled = hostPort.toIntOrNull() != null && containerPort.toIntOrNull() != null,
+                    enabled = portValid,
                     onClick = {
-                        vm.addPort(proto, hostPort.toIntOrNull() ?: 0, containerPort.toIntOrNull() ?: 0)
+                        if (hostPortValue != null && containerPortValue != null) {
+                            vm.addPort(proto, hostPortValue, containerPortValue)
+                        }
                     },
                 ) { Text("添加") }
                 OutlinedButton(onClick = { vm.syncPorts() }) { Text("重放全部") }
@@ -412,7 +426,7 @@ private fun SnapshotsTab(
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(
-                    enabled = label.isNotBlank() && state.info?.running != true,
+                    enabled = label.trim().matches(Regex("^[A-Za-z0-9_-]+$")) && state.info?.running != true,
                     onClick = { vm.createSnapshot(label.trim()) },
                 ) { Text("建快照") }
             }

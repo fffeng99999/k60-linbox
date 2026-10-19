@@ -59,7 +59,8 @@ su -c 'linbox caps'
 
 # 4. 登记 base 根文件系统并建容器
 su -c 'linbox base add debian /data/local/rootfs/debian'
-su -c 'linbox create demo --base debian --host demo --mem 2048'
+su -c 'linbox create demo --base debian --host demo --mem 2048 --mirror aliyun'
+#    默认自动选 init：/sbin/init → /init → 生成最小 /init；普通 rootfs 归档也能直接启动
 
 # 5. 启动 / 进入 / 停止
 su -c 'linbox start demo'

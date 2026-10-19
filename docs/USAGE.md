@@ -19,6 +19,11 @@ mkdir -p /data/local/rootfs
 
 > 也可在开发机上解包发行版 rootfs tarball，再 `adb push` 到设备。
 
+> 导入优先用 **busybox tar**（toybox tar 会跳过指向目标目录外的绝对符号链接，
+> 例如 Ubuntu 的 `/usr/bin/awk -> /etc/alternatives/awk`，导致 rootfs 残缺）。
+> Ubuntu/Debian 归档在登记前会校验 `apt-get`/`dpkg` 与软件包数量；下载损坏或解包
+> 不完整的归档会被拒绝，不会留下“连 apt 都没有”的 base。
+
 ## 2. 安装运行时
 
 方式 A（推荐）：安装 CI 产物 Magisk 模块 `k60-linbox-magisk.zip`：
@@ -60,9 +65,10 @@ su -c 'linbox list'
 | `--base 名` | 必填，引用已登记的 base | — |
 | `--host 名` | 容器主机名（UTS） | `linbox-<容器名>` |
 | `--ip 地址` | 容器 IP | 自动从 `172.30.0.0/24` 分配 |
-| `--mem 兆` | 内存上限（cgroup v2） | `2048` |
+| `--mem 兆` | 内存上限（cgroup v2，1-1048576） | `2048` |
 | `--size 大小` | 磁盘镜像大小（`truncate` 语法，如 `4G`） | `4G` |
-| `--init 路径` | 容器内 init 路径（相对 rootfs） | `/sbin/init` |
+| `--init 路径` | 容器内 init 路径；**留空自动**：优先 `/sbin/init`，其次 `/init`，都没有则生成最小 `/init` | 自动 |
+| `--mirror 预设` | 创建时直接把 apt 源改为 `tuna`/`aliyun`/`ustc`/`official` | 不换源 |
 
 ## 5. 启停与进入
 
@@ -76,6 +82,10 @@ su -c 'linbox restart demo'
 
 容器启动后，它拥有独立 IP（`ip netns exec linbox-demo ip addr`），从宿主机可直接
 访问；容器经 NAT 出网。
+
+> 从普通 Ubuntu/Debian rootfs 归档（没有 systemd）新建容器时，运行时会在镜像里生成
+> 一个最小 `/init`，因此**不装 systemd 也能启动**，仍然可以用 `linbox exec`/`shell`。
+> 想用发行版自己的 init（systemd）时，按 §10 装好后用 `linbox set demo --init /sbin/init`。
 
 ## 6. 快照与恢复
 
@@ -219,10 +229,10 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
   `172.30.0.0/24` 加策略路由指向 main 表（Android netd 的 per-network 路由表
   与 fwmark 规则会把外来网桥的流量导错，详见 docs/VERIFICATION.md 第 12 节）。
 - **`linbox caps` 显示 PID 命名空间 no**：属预期，打内核补丁后变为 yes。
-- **新建的容器启动后立刻退出**：运行时默认 `--init /sbin/init`，而普通 debootstrap/归档
-  的 base 里并没有 `/sbin/init`（没装 systemd）。两条路：给 base 装 systemd（见 §10），
-  或创建时显式 `--init /init` 用脚本 init。`su -c 'linbox log <名>'` 会看到
-  「容器启动后立即退出，请检查 rootfs 的 <init> 是否存在且可执行」这条告警。
+- **新建的容器启动后立刻退出**：现在创建时会自动选择 init：有 `/sbin/init` 用 systemd，
+  否则用 `/init`；两者都没有时自动生成最小 `/init`。如果显式传了不存在的 `--init`，
+  `create` 会直接报 `INIT_NOT_FOUND`，不会再建出必然失败的容器。启动后仍退出时看
+  `su -c 'linbox log <名>'`，`start` 本身会返回非 0，并提示退出码。
 - **启动后立刻退出，日志是 `setting the network namespace "linbox-<名>" failed: Invalid argument`**：
   `/mnt/run/linbox-<名>` 是网络命名空间残骸（文件还在但已不是有效的 netns）。
   当前运行时会自动探测并重建，直接重试 `linbox start` 即可；若你手上是旧版本运行时，

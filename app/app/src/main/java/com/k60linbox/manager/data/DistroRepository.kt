@@ -7,6 +7,7 @@ import com.k60linbox.manager.net.Downloader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 
 /**
  * 发行版「下载 + 导入」流水线：解析地址 → 断点续传下载 → 校验 → `linbox base import`。
@@ -30,15 +31,22 @@ class DistroRepository(private val context: Context) {
             val target = File(context.cacheDir, resolved.fileName)
             downloader.download(resolved.url, target, onProgress).getOrThrow()
 
-            // 校验尽力而为：镜像站可能没有 sums 文件，此时只提示、不阻断；
-            // 内容损坏其实还会在 tar 解包时被 gzip/xz 校验拦下。
-            val verifyNote: String = downloader
-                .verify(resolved.sumsUrl, resolved.algorithm, resolved.fileName, target)
-                .fold({ "校验通过（${resolved.algorithm}）" }, { "未校验（${it.message}）" })
+            // 校验必须阻断：断点续传/代理错误可能拼出“能解包一部分”的归档，
+            // 继续导入就会得到缺 apt 的残缺 base。失败时删掉文件，方便下次从头下载。
+            val verify = downloader.verify(
+                resolved.sumsUrl,
+                resolved.algorithm,
+                resolved.fileName,
+                target,
+            )
+            if (verify.isFailure) {
+                runCatching { target.delete() }
+                throw IOException("归档校验失败：${verify.exceptionOrNull()?.message ?: "未知原因"}")
+            }
 
             bases.import(target.absolutePath, distro.suggestedBase).getOrThrow()
             runCatching { target.delete() }
-            Outcome(distro.suggestedBase, verifyNote)
+            Outcome(distro.suggestedBase, "校验通过（${resolved.algorithm}）")
         }
     }
 }

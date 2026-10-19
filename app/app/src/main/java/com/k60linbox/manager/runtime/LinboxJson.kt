@@ -93,6 +93,8 @@ data class ContainerInfo(
     val ip: String = "",
     val host: String = "",
     @SerialName("memoryMB") val memoryMB: Int? = null,
+    /** 镜像大小（如 4G），用于详情页扩容时预填当前值。 */
+    val size: String? = null,
 ) {
     val running: Boolean get() = status == "running"
 }
@@ -224,6 +226,7 @@ data class ActionInfo(
     @SerialName("memoryMB") val memoryMB: Int? = null,
     val size: String? = null,
     val bytes: Long? = null,
+    val init: String? = null,
     val mirror: String? = null,
     val distro: String? = null,
     val synced: Int? = null,
