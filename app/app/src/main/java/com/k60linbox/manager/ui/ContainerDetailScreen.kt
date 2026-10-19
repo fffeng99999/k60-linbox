@@ -65,9 +65,10 @@ fun ContainerDetailScreen(name: String, onBack: () -> Unit) {
         pendingDownload = null
     }
 
-    // 切到「文件」页时才去列目录：停止态的容器会临时挂载镜像，不该白挂。
+    // 「文件」页才去列目录（停止态会临时挂载镜像，不该白挂）；「日志」页自动拉一次。
     LaunchedEffect(tab) {
         if (tab == 2) vm.openDir(state.currentPath)
+        if (tab == 5) vm.loadLogs()
     }
 
     LaunchedEffect(state.message) {
@@ -186,12 +187,12 @@ private fun OverviewTab(
         }
 
         Spacer(Modifier.height(12.dp))
-        var sizeText by remember { mutableStateOf("8G") }
+        var sizeText by remember(info?.size) { mutableStateOf(info?.size ?: "8G") }
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = sizeText,
                 onValueChange = { sizeText = it },
-                label = { Text("磁盘容量（停止态扩容）") },
+                label = { Text("磁盘容量（当前 ${info?.size ?: "?"}，只能扩容）") },
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
@@ -207,8 +208,15 @@ private fun OverviewTab(
         Spacer(Modifier.height(16.dp))
         Text("容器内 apt 换源", style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(6.dp))
+        // 四个按钮放一行会溢出（官方源被挤出屏幕），拆成两行。
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            MirrorPresets.all.forEach { preset ->
+            MirrorPresets.all.take(3).forEach { preset ->
+                OutlinedButton(onClick = { vm.applyMirrorAndVerify(preset.id) }) { Text(preset.label) }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MirrorPresets.all.drop(3).forEach { preset ->
                 OutlinedButton(onClick = { vm.applyMirrorAndVerify(preset.id) }) { Text(preset.label) }
             }
         }
