@@ -196,3 +196,9 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
   的 base 里并没有 `/sbin/init`（没装 systemd）。两条路：给 base 装 systemd（见 §10），
   或创建时显式 `--init /init` 用脚本 init。`su -c 'linbox log <名>'` 会看到
   「容器启动后立即退出，请检查 rootfs 的 <init> 是否存在且可执行」这条告警。
+- **启动后立刻退出，日志是 `setting the network namespace "linbox-<名>" failed: Invalid argument`**：
+  `/mnt/run/linbox-<名>` 是网络命名空间残骸（文件还在但已不是有效的 netns）。
+  当前运行时会自动探测并重建，直接重试 `linbox start` 即可；若你手上是旧版本运行时，
+  先 `su -c 'ip netns del linbox-<名>; rm -f /mnt/run/linbox-<名>'` 再启动。
+- **同一容器别并发启动/停止**：运行时会加锁串行化（第二个会等或报 `ALREADY_RUNNING`），
+  但用脚本狂点/循环 `linbox start` 仍可能把命名空间搅乱——一次只跑一个操作。

@@ -380,5 +380,56 @@ v1 控制器，故自标 `tainted: cgroupsv1`——不影响使用。
 
 容器停止后仍然零残留：loop=0、`linbox_<名>` cgroup 已删除、无容器 root 的残留进程。
 
+## 16. 「容器启动不了」：netns 残骸与并发启动（2026-10-19 实测）
+
+现象：容器一启动就以 rc=1 退出，`linbox log <名>` 只有一行
+
+```text
+setting the network namespace "linbox-ubuntu24" failed: Invalid argument
+```
+
+### 16.1 根因：`/mnt/run/linbox-<名>` 成了残骸
+
+该文件还在，但已经不是有效的 netns 挂载（`ip netns del` 只完成了 unmount 而没删掉文件，
+或并发启动互相删掉对方刚建好的命名空间）。关键点是：**`ip netns list` 仍会把它列出来**，
+所以「列表里有名字就跳过创建」的旧逻辑会直接复用它，`setns` 随即报 `Invalid argument`。
+
+100% 稳定复现：
+
+```text
+$ touch /mnt/run/linbox-ubuntu24
+$ ip netns exec linbox-ubuntu24 true
+setting the network namespace "linbox-ubuntu24" failed: Invalid argument   (rc=1)
+```
+
+### 16.2 修法一：用实探测代替「列表里有名字」
+
+`setup_net` 改成先 `ip netns exec <ns> true` 探测能不能真进去；进不去就
+`ip netns del`（删不掉时 `umount` + `rm -f` 兜底）重建，并顺带校验 veth 对端确实在命名
+空间里（`ip netns exec <ns> ip link show <veth>c`），地址/默认路由改为幂等 `replace`。
+复验：造出残骸文件后 `linbox start` 直接成功（rc=0，容器 running）。
+
+### 16.3 修法二：start/stop/destroy 串行化
+
+同一秒内两次 `start` 会互相删掉对方刚建的命名空间——实测出现**两个实例、两个 loop 设备**：
+
+```text
+$ linbox stop ubuntu24
+$ linbox start ubuntu24 & linbox start ubuntu24
+[两个都打印「已启动」]   status → pid=139159   losetup -a → 2 个同镜像 loop
+```
+
+改用 `mkdir` 原子锁（`/data/local/linbox/lock/<名>`，锁内记持有者 pid，持有者已退出就自动清）。
+**锁必须在「是否已在运行」检查之前拿**：先查后锁时两个进程都会在对方写好 `run/pid` 之前
+通过检查。复验：并发两次 `start` → 一个成功、另一个报
+`错误(ALREADY_RUNNING): 容器已在运行`；loops=1。
+
+### 16.4 附带：systemd 容器的 cgroup 目录残留
+
+容器里跑 systemd 会建 `linbox_<名>/init.scope`、`system.slice/*.service` 等子目录，
+`rmdir` 因「非空」失败 → 目录留在宿主上（进程已清空，属外观残留）。`teardown_cgroup`
+改为先把进程挪回根、再自底向上清 4 轮空目录。复验：stop 后 `cgroup=0`。
+
+
 
 

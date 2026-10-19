@@ -40,6 +40,8 @@ BRIDGE=${LINBOX_BRIDGE:-lbx0}
 GATEWAY=172.30.0.1
 SUBNET=172.30.0.0/24
 MNT_NAME=mnt
+# Android 自带 iproute2 把网络命名空间放在这里（`ip netns add` 报错时会打印该路径）
+NETNS_DIR=${LINBOX_NETNS_DIR:-/mnt/run}
 
 J=0                 # 是否 JSON 模式
 [ "${LINBOX_JSON:-0}" = "1" ] && J=1
@@ -102,6 +104,38 @@ opt_val() {
 # ---------------------------------------------------------------- 通用工具
 
 ensure_dirs() { mkdir -p "$BASE_DIR" "$CONT_DIR" "$RUN_DIR" 2>/dev/null; }
+
+# ---------------------------------------------------------------- 并发串行化
+#
+# start/stop 必须串行：两个启动流程并发时会互相把对方刚建好的网络命名空间删掉，
+# 表现为 `setting the network namespace "linbox-<名>" failed: Invalid argument`、
+# 容器 rc=1 立即退出（实测：同一秒内多个 start 就会触发）。
+# mkdir 在 Android 的 f2fs/ext4 上都是原子的，故用它当锁；锁里记持有者 pid，
+# 持有者已退出就自动清掉，避免崩溃后锁一直留着。
+lock_path() { printf '%s' "$LINBOX_DIR/lock/$1"; }
+
+acquire_lock() {
+    _name=$1
+    _lk="$(lock_path "$_name")"
+    mkdir -p "$(dirname "$_lk")" 2>/dev/null
+    _i=0
+    while [ "$_i" -lt 150 ]; do
+        if mkdir "$_lk" 2>/dev/null; then
+            printf '%s\n' "$$" > "$_lk/pid" 2>/dev/null || true
+            return 0
+        fi
+        _op="$(cat "$_lk/pid" 2>/dev/null || true)"
+        [ "$_op" = "$$" ] && return 0          # 同进程重入（restart 会 stop 再 start）
+        if [ -n "$_op" ] && [ ! -d "/proc/$_op" ]; then
+            rm -rf "$_lk" 2>/dev/null || true      # 持有者已死：清掉再抢
+            continue
+        fi
+        sleep 0.2; _i=$((_i + 1))
+    done
+    fail BUSY "另一个 linbox 操作正在处理容器 $_name，请稍后重试"
+}
+
+release_lock() { rm -rf "$(lock_path "$1")" 2>/dev/null || true; }
 
 valid_name() {
     case "$1" in
@@ -546,27 +580,41 @@ setup_net() {
     _ns="linbox-$_name"
     _h="vlinbox${_idx}"
     _c="${_h}c"
-    if ! ip netns list 2>/dev/null | grep -qx "$_ns"; then
-        # 残留的 netns 文件（容器崩溃退出、没走 stop 时留下）会让创建报
-        # "Cannot create namespace file ...: File exists"，而它又不出现在 ip netns list 里，
-        # 所以创建失败时先删掉残余文件与半截 veth 再重试一次。
+
+    # 命名空间必须「真能进去」：光看 /mnt/run 下有名字不算数——崩溃/并发启动留下的
+    # 残骸（文件还在但挂载已掉，或指向已被内核回收的 passive netns）会让后续
+    # `ip netns exec` 报 `setting the network namespace "..." failed: Invalid argument`，
+    # 容器随即以 rc=1 退出。这里用一次廉价的 exec 探测代替 `ip netns list` 判断，
+    # 探测不过就删掉文件（必要时直接 umount 兜底）重建。
+    if ! ip netns exec "$_ns" true >/dev/null 2>&1; then
+        ip netns del "$_ns" 2>/dev/null || true
+        ip link del "$_h" 2>/dev/null || true
         if ! ip netns add "$_ns" 2>/dev/null; then
-            ip netns del "$_ns" 2>/dev/null || true
-            ip link del "$_h" 2>/dev/null || true
+            # ip netns del 删不掉时（文件已不是有效挂载）直接清 /mnt/run 下的残骸
+            umount "$NETNS_DIR/$_ns" 2>/dev/null || true
+            rm -f "$NETNS_DIR/$_ns" 2>/dev/null || true
             ip netns add "$_ns" || fail NET_NS "无法创建网络命名空间 $_ns"
         fi
+        ip netns exec "$_ns" true >/dev/null 2>&1 || fail NET_NS "网络命名空间 $_ns 不可用"
     fi
-    if ! ip link show "$_h" >/dev/null 2>&1; then
+
+    # veth 必须存在且对端确实在容器命名空间里，否则（半途失败留下的残骸）重建
+    if ! ip link show "$_h" >/dev/null 2>&1 || \
+       ! ip netns exec "$_ns" ip link show "$_c" >/dev/null 2>&1; then
+        ip link del "$_h" 2>/dev/null || true
         ip link add "$_h" type veth peer name "$_c" || fail NET_VETH "无法创建 veth 对"
         ip link set "$_c" netns "$_ns"
-        ip link set "$_h" master "$BRIDGE"
-        ip link set "$_h" up
-        ip netns exec "$_ns" ip addr add "$_ip/24" dev "$_c"
-        ip netns exec "$_ns" ip link set "$_c" up
-        ip netns exec "$_ns" ip link set lo up
-        ip netns exec "$_ns" ip route add default via "$GATEWAY"
-        log "容器 $_name 网络就绪: $_ip (ns=$_ns)"
     fi
+    ip link set "$_h" master "$BRIDGE" 2>/dev/null || true
+    ip link set "$_h" up 2>/dev/null || true
+    ip netns exec "$_ns" ip link set "$_c" up 2>/dev/null || true
+    ip netns exec "$_ns" ip link set lo up 2>/dev/null || true
+    # 地址与默认路由按幂等方式补齐（重启/重建后可能已存在，也可能缺失）
+    ip netns exec "$_ns" ip addr replace "$_ip/24" dev "$_c" 2>/dev/null || \
+        ip netns exec "$_ns" ip addr add "$_ip/24" dev "$_c" 2>/dev/null || true
+    ip netns exec "$_ns" ip route replace default via "$GATEWAY" 2>/dev/null || \
+        ip netns exec "$_ns" ip route add default via "$GATEWAY" 2>/dev/null || true
+    log "容器 $_name 网络就绪: $_ip (ns=$_ns)"
 }
 
 teardown_net() {
@@ -596,6 +644,16 @@ teardown_cgroup() {
             printf '%s\n' "$_p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
         done
     fi
+    # 容器里跑 systemd 时会在本 cgroup 下建 init.scope / system.slice/*.service 等子
+    # 目录，直接 rmdir 会因「非空」失败而把整个目录留在宿主上。子目录此时都已是空的
+    # （进程已挪走），自底向上清几轮即可；rmdir 只删空目录，不会误伤任何进程。
+    _i=0
+    while [ "$_i" -lt 4 ]; do
+        for _d in "$_cg"/*/ "$_cg"/*/*/; do
+            [ -d "$_d" ] && rmdir "$_d" 2>/dev/null || true
+        done
+        _i=$((_i + 1))
+    done
     rmdir "$_cg" 2>/dev/null || true
 }
 
@@ -853,6 +911,11 @@ _devnum() {
 cmd_start() {
     _name=${1:-}
     load_config "$_name"
+
+    # 先拿锁再查「是否已在运行」：并发调用时若先查后锁，两个进程都会在对方写好
+    # run/pid 之前通过检查，于是同时启动，起出两个实例、两个 loop（实测）。
+    acquire_lock "$_name"
+    trap 'release_lock "$_name"' EXIT
     running_pid "$_name" >/dev/null 2>&1 && fail ALREADY_RUNNING "容器已在运行: $_name"
 
     _cd="$(cont_dir "$_name")"
@@ -947,6 +1010,8 @@ cmd_start() {
 cmd_stop() {
     _name=${1:-}
     load_config "$_name"
+    acquire_lock "$_name"
+    trap 'release_lock "$_name"' EXIT
     _rd="$(run_dir "$_name")"
     _pid="$(running_pid "$_name" 2>/dev/null || true)"
     _lp="$(cat "$_rd/launch" 2>/dev/null || true)"
@@ -1016,6 +1081,8 @@ cmd_destroy() {
     _name=${1:-}
     valid_name "$_name" || fail BAD_NAME "非法容器名: $_name"
     [ -d "$(cont_dir "$_name")" ] || fail NO_CONTAINER "容器不存在: $_name"
+    acquire_lock "$_name"
+    trap 'release_lock "$_name"' EXIT
     running_pid "$_name" >/dev/null 2>&1 && { cmd_stop "$_name" >/dev/null 2>&1 || true; }
     kill_stragglers "$_name"
     detach_loops "$_name"
