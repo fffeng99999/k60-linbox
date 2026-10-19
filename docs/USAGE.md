@@ -229,3 +229,9 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
   先 `su -c 'ip netns del linbox-<名>; rm -f /mnt/run/linbox-<名>'` 再启动。
 - **同一容器别并发启动/停止**：运行时会加锁串行化（第二个会等或报 `ALREADY_RUNNING`），
   但用脚本狂点/循环 `linbox start` 仍可能把命名空间搅乱——一次只跑一个操作。
+- **「扩容」报 `不支持缩容`（但目标明明更大）**：旧版运行时在任一侧 ≥ 2GiB 时会误判——
+  设备上的 sh 整数是 32 位，`3221225472`（3G）会溢出成负数，于是「3G < 1G」成立。
+  新版已改用 awk 换算与比较；升级到模块 0.1.4 后重试即可。
+- **新建容器时别选没有 `/sbin/init` 的 base**：App 的 init 默认填 `/sbin/init`，
+  若这个 base 里没有它（例如只导入了一半的 rootfs），容器会启动即退出。先给该 base
+  装 systemd（§10.1），或把 init 改成这个 base 里真实存在的路径（如 `/init`）。

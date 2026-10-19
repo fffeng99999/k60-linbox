@@ -385,6 +385,21 @@ cmd_base() {
 
 busboy_has() { busybox --list 2>/dev/null | grep -qx "$1"; }
 
+# 设备上的 sh 是 32 位整数：$((3221225472+1)) 得到 -1073741823，`[ 3221225472 -lt 1073741824 ]`
+# 会判定为真。凡是「字节数」这种必然超过 2^31 的值，一律交给 awk 换算与比较（双精度，
+# 1e13 以内精确）。缩容误判就是这么来的：3G 被截成负数，于是「3G < 1G」成立。
+size_to_bytes() {
+    printf '%s' "$1" | awk '
+        { n=$0; u=""
+          if (n ~ /^[0-9]+[KkMmGgTt]$/) { u=tolower(substr(n,length(n),1)); n=substr(n,1,length(n)-1) }
+          else if (n !~ /^[0-9]+$/) { print 0; exit }
+          m = (u=="k") ? 1024 : (u=="m") ? 1048576 : (u=="g") ? 1073741824 : (u=="t") ? 1099511627776 : 1
+          printf "%.0f\n", n*m }'
+}
+
+# awk 版数值比较（避开 32 位截断）：a < b 时返回 0
+num_lt() { awk -v a="$1" -v b="$2" 'BEGIN{ exit (a < b) ? 0 : 1 }'; }
+
 # 在宿主命名空间把容器镜像挂到 containers/<名>/mnt（停止态文件操作/换源/扩容前用）
 image_mount_host() {
     _name=$1
@@ -413,7 +428,12 @@ cmd_resize() {
     _cd="$(cont_dir "$_name")"
     _img="$_cd/$IMAGE"
     _cur="$(stat -c %s "$_img" 2>/dev/null || echo 0)"
-    log "当前镜像 $_cur 字节，目标 $_size"
+    # 注意别用 _want 之类会被 has_flag 当作全局变量覆盖的名字（脚本里变量全是全局的）
+    _want_bytes="$(size_to_bytes "$_size")"
+    case "$_want_bytes" in
+        ''|0|*[!0-9]*) fail BAD_ARGS "--size 需形如 8G / 512M / 1048576" ;;
+    esac
+    log "当前镜像 $_cur 字节，目标 $_size（$_want_bytes 字节）"
 
     if has_flag --dry-run "$@"; then
         if busboy_has resize2fs || command -v resize2fs >/dev/null 2>&1; then
@@ -424,12 +444,16 @@ cmd_resize() {
         return 0
     fi
 
-    # 只支持扩容（缩容有丢数据风险）
-    truncate -s "$_size" "$_img" || fail RESIZE_FAILED "truncate 失败"
+    # 只支持扩容（缩容有丢数据风险）。注意用 num_lt（awk）而不是 `[ -lt ]`：设备的 sh
+    # 是 32 位，3G(3221225472) 会被截成负数，导致「扩容」被误判成「缩容」而拒绝。
+    if num_lt "$_want_bytes" "$_cur"; then
+        fail RESIZE_SHRINK_UNSUPPORTED "不支持缩容（当前 $_cur 字节，请求 $_want_bytes 字节）"
+    fi
+    truncate -s "$_want_bytes" "$_img" || fail RESIZE_FAILED "truncate 失败"
     _new="$(stat -c %s "$_img" 2>/dev/null || echo 0)"
-    if [ "$_new" -lt "$_cur" ]; then
+    if num_lt "$_new" "$_cur"; then
         truncate -s "$_cur" "$_img" 2>/dev/null || true
-        fail RESIZE_SHRINK_UNSUPPORTED "不支持缩容"
+        fail RESIZE_FAILED "truncate 未生效（已回滚为原大小）"
     fi
 
     _LD="$(losetup -f 2>/dev/null)" || fail TOOL_MISSING "没有空闲 loop 设备"
