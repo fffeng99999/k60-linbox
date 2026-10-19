@@ -192,3 +192,7 @@ fastboot boot boot-linbox.img      # 临时启动，不刷分区
   `172.30.0.0/24` 加策略路由指向 main 表（Android netd 的 per-network 路由表
   与 fwmark 规则会把外来网桥的流量导错，详见 docs/VERIFICATION.md 第 12 节）。
 - **`linbox caps` 显示 PID 命名空间 no**：属预期，打内核补丁后变为 yes。
+- **新建的容器启动后立刻退出**：运行时默认 `--init /sbin/init`，而普通 debootstrap/归档
+  的 base 里并没有 `/sbin/init`（没装 systemd）。两条路：给 base 装 systemd（见 §10），
+  或创建时显式 `--init /init` 用脚本 init。`su -c 'linbox log <名>'` 会看到
+  「容器启动后立即退出，请检查 rootfs 的 <init> 是否存在且可执行」这条告警。
