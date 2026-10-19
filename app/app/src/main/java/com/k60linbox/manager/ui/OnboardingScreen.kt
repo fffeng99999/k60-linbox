@@ -41,7 +41,8 @@ private enum class HelpKind { MODULE, KERNEL }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OnboardingScreen(onFinish: () -> Unit) {
-    val app = LocalContext.current.applicationContext as Application
+    val context = LocalContext.current
+    val app = context.applicationContext as Application
     val vm: OnboardingViewModel = viewModel(factory = SimpleFactory { OnboardingViewModel(app) })
     val state by vm.state.collectAsStateWithLifecycle()
     var help by remember { mutableStateOf<HelpKind?>(null) }
@@ -70,14 +71,40 @@ fun OnboardingScreen(onFinish: () -> Unit) {
 
             val info = state.info
             if (info == null) {
+                val raw = state.error
+                    ?: "请先安装 k60_linbox 模块，或在终端执行 linbox doctor 排查。"
+                // doctor 本身就要经 su 执行；没有 root 时只会得到 NO_JSON/空输出。
+                // 这时必须明确提示“去 Magisk 授权”，而不是误导成“运行时没装”。
+                val rootDenied = raw.contains("NO_JSON") || raw.contains("NOT_ROOT") ||
+                    raw.contains("root", ignoreCase = true)
+                val magisk = remember(rootDenied) {
+                    if (!rootDenied) null
+                    else runCatching {
+                        context.packageManager.getLaunchIntentForPackage("com.topjohnwu.magisk")
+                    }.getOrNull()
+                }
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
-                        Text("没有检测到 linbox 运行时", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            if (rootDenied) "还没有拿到 root 权限" else "没有检测到 linbox 运行时",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            state.error ?: "请先安装 k60_linbox 模块，或在终端执行 linbox doctor 排查。",
+                            if (rootDenied) {
+                                "无法以 root 执行 linbox。请在 Magisk 的超级用户列表里允许本应用，" +
+                                    "然后点「重新检测」。\n\n原始信息：$raw"
+                            } else {
+                                raw
+                            },
                             style = MaterialTheme.typography.bodySmall,
                         )
+                        if (magisk != null) {
+                            Spacer(Modifier.height(4.dp))
+                            TextButton(onClick = { context.startActivity(magisk) }) {
+                                Text("打开 Magisk")
+                            }
+                        }
                     }
                 }
             } else {

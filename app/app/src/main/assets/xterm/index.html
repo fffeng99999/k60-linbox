@@ -150,7 +150,7 @@
       // 自证：不走 PTY，直接往终端写一行，验证渲染通路是否通
       setTimeout(function () {
         try {
-          term.write('\u001b[36m[k60-linbox] 终端渲染自检\u001b[0m\r\n$ ');
+          term.write('\r\n\u001b[36m[k60-linbox] 终端渲染自检\u001b[0m\r\n$ ');
           log('selftest: 已写入自检文本');
         } catch (e) { log('selftest 异常: ' + e); }
       }, 300);

@@ -196,7 +196,7 @@ private fun OverviewTab(
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = sizeText.trim().matches(Regex("^[0-9]+[KkMmGgTt]?$")) && info?.running != true,
+                enabled = sizeText.trim().matches(Regex("^[1-9][0-9]*[KkMmGgTt]?$")) && info?.running != true,
                 onClick = { vm.resize(sizeText.trim()) },
             ) { Text("扩容") }
         }

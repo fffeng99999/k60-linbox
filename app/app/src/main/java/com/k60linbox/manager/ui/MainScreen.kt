@@ -57,6 +57,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.k60linbox.manager.data.copyUriTo
@@ -80,6 +82,8 @@ fun MainScreen(onOpen: (String) -> Unit) {
     val app = context.applicationContext as Application
     val vm: MainViewModel = viewModel(factory = SimpleFactory { MainViewModel(app) })
     val state by vm.state.collectAsStateWithLifecycle()
+    // 从详情页返回时 MainScreen 会重新 resume；这里刷新一次，避免销毁容器后列表还显示旧项。
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refresh() }
     val snackbar = remember { SnackbarHostState() }
     var tab by remember { mutableIntStateOf(0) }
     var createOpen by remember { mutableStateOf(false) }
@@ -245,7 +249,7 @@ private fun CreateDialog(
     val memValue = mem.trim().toIntOrNull()
     val valid = name.trim().matches(Regex("^[A-Za-z0-9_-]+$")) &&
         base.isNotBlank() &&
-        size.trim().matches(Regex("^[0-9]+[KkMmGgTt]?$")) &&
+        size.trim().matches(Regex("^[1-9][0-9]*[KkMmGgTt]?$")) &&
         memValue != null && memValue in 1..1048576 &&
         (init.isBlank() || init.trim().startsWith("/"))
 
@@ -576,7 +580,7 @@ private fun SettingsTab(state: MainViewModel.State, vm: MainViewModel) {
                 modifier = Modifier.weight(1f),
             )
             TextButton(
-                enabled = size.trim().matches(Regex("^[0-9]+[KkMmGgTt]?$")),
+                enabled = size.trim().matches(Regex("^[1-9][0-9]*[KkMmGgTt]?$")),
                 onClick = { vm.setDefaultSize(size.trim()) },
             ) { Text("保存") }
         }
