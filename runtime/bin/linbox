@@ -160,14 +160,22 @@ save_config() {
     for item in "$@"; do printf '%s\n' "$item" >> "$_sc_file"; done
 }
 
+# 进程是否真的活着：僵尸进程的 /proc/<pid> 仍然存在，不能只判目录。
+proc_alive() {
+    [ -n "${1:-}" ] && [ -d "/proc/$1" ] || return 1
+    _pa_state="$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null || true)"
+    [ "$_pa_state" != "Z" ]
+}
+
 # 容器存活判定：优先用 run/pid（容器 PID 1 的宿主 PID）。
 running_pid() {
     _rp="$RUN_DIR/$1/pid"
     [ -f "$_rp" ] || return 1
     _p="$(cat "$_rp" 2>/dev/null)"
     [ -n "$_p" ] || return 1
-    [ -d "/proc/$_p" ] && { printf '%s\n' "$_p"; return 0; }
-    return 1
+    proc_alive "$_p" || return 1
+    printf '%s\n' "$_p"
+    return 0
 }
 
 # 是否支持某个 unshare 命名空间（-p / -m / -n / -u）
@@ -1185,6 +1193,9 @@ cmd_start() {
     # 未启用 PID 命名空间时 unshare 直接 exec 进 __enter，同样能被这个判据命中。
     _cpid="$_launched"; _chain="$_launched"; _i=0
     while [ "$_i" -lt 60 ]; do
+        # init 在 chroot 前就退出时，后台子 shell 会很快结束；不要空转满 60 轮
+        # （12 秒），否则 start 失败路径看起来像卡住。
+        proc_alive "$_launched" || break
         _c="$(pgrep -P "$_cpid" 2>/dev/null | head -n1)"
         [ -n "$_c" ] && { _cpid="$_c"; _chain="$_chain $_c"; }
         _found=""
