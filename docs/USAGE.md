@@ -169,6 +169,33 @@ su -c 'linbox start demo'
 
 回退到脚本 init：`su -c 'linbox set demo --init /init'`（原 `/init` 仍在镜像里）。
 
+### 10.1 直接把 systemd 装进 base 目录
+
+这样之后新建的容器都自带 systemd（默认 `--init /sbin/init` 直接就可用）。
+base 是个普通目录，chroot 进去装即可：
+
+```sh
+B=/data/local/rootfs/ubuntu          # 你的 base 目录
+mount -t proc proc "$B/proc"; mount -t sysfs sysfs "$B/sys"
+mount -t tmpfs tmpfs "$B/dev"; mknod "$B/dev/null" c 1 3; chmod 666 "$B/dev/null"
+printf '#!/bin/sh\nexit 101\n' > "$B/usr/sbin/policy-rc.d"; chmod 755 "$B/usr/sbin/policy-rc.d"
+chroot "$B" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd systemd-sysv dbus
+rm -f "$B/usr/sbin/policy-rc.d"
+chroot "$B" apt-get clean; rm -rf "$B/var/lib/apt/lists"/*
+: > "$B/etc/machine-id"              # 让每个新容器各自生成，别共用同一个
+umount "$B/dev" "$B/sys" "$B/proc"   # ← 必须卸干净！
+```
+
+> 最后一步不能省：`linbox create` 是用 `mke2fs -d <base 目录>` 直接灌镜像的，
+> base 里若还挂着 proc/sys/dev，这些挂载内容会被一起抄进镜像。
+> 装完用 `grep -c "$B/" /proc/mounts` 复查应为 0。
+
+实测：装完后用默认参数 `linbox create` 建的容器，`/proc/1/cmdline` 就是 `/sbin/init`、
+`systemctl is-system-running` = `running`。注意 `systemctl mask` 在 chroot 里会失败
+（没有运行中的 systemd），要屏蔽 `serial-getty@hvc0.service` 请直接建软链：
+`ln -sf /dev/null "$B/etc/systemd/system/serial-getty@hvc0.service"`。
+
 ## 11. 内核补丁（解锁独立 PID 1）
 
 ```bash
