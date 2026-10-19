@@ -531,6 +531,30 @@ start（INIT=/nope）   → rc=1，错误 CONTAINER_EXITED(127)
 - `port add tcp 70000 22`：`BAD_ARGS`（端口 1-65535）；
 - `create --mirror aliyun`：镜像内 `ubuntu.sources` 已是 aliyun，`apt-get` 可用。
 
+### 18.6 跨 su 上下文执行：不要用 `ip netns exec`（运行时 1.1.1 / 模块 0.1.6）
+
+用 App 装好并启动 Ubuntu 22.04 容器后，再从 **adb shell 的 su** 执行
+`linbox exec` 会报：
+
+```text
+setting the network namespace "linbox-Ubuntu22" failed: Invalid argument
+```
+
+但同一容器在 App 的快捷执行/终端里正常。根因：Magisk 的 `su` 调用之间可能有
+mount namespace 隔离，`ip netns add` 建立的 `/mnt/run/<名>` bind mount 只在创建它的
+namespace 里可见；`ip netns exec` 跨 namespace 就会 EINVAL。`linbox` 的
+`exec/shell/attach` 本身已经有 `nsenter -t <pid> -n`，外层再套 `ip netns exec`
+既多余又脆弱。修法：去掉外层 `ip netns exec`，只按容器 PID 进 netns。
+
+复验（Ubuntu 22.04.5，App 安装的 base，101 包）：
+
+```text
+adb shell su -c 'linbox exec Ubuntu22 -- id'        → uid=0(root)
+adb shell su -c 'linbox exec Ubuntu22 -- apt-get...' → apt 2.4.13 (arm64)
+linbox shell / linbox attach（80x24）                → 正常
+App 快捷执行 / 终端                                  → 正常
+```
+
 
 
 
